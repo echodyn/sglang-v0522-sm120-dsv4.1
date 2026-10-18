@@ -1,0 +1,64 @@
+name: dsv41-sm120
+services:
+  sglang:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sglang:v0.5.22-sm120-dsv41
+    container_name: dsv41-sm120
+    # restart: unless-stopped
+    cap_add:
+      - SYS_NICE
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    volumes:
+      - HOST_MODEL_PATH:CONTAINER_MODEL_PATH
+    environment:
+      HF_HUB_OFFLINE: "1"
+      SGLANG_SM120_FLASHMLA_BACKEND: "flashinfer"
+      # E-gram offload.
+      SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
+    entrypoint: ["sglang", "serve"]
+    command:
+      - --model-path
+      - "CONTAINER_MODEL_PATH"
+      - --served-model-name
+      - dsv41-flash-1017
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tp
+      - "4"
+      # --ep-size must be set to 4 for SM120, otherwise sglang will throw an error.
+      - --ep-size
+      - "4"
+      - --attention-backend
+      - dsv4
+      - --moe-runner-backend
+      - flashinfer_mxfp4
+      - --fp8-gemm-backend
+      - cutlass
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-algorithm
+      - DSPARK
+      - --speculative-dspark-block-size
+      - "5"
+      - --context-length
+      - "524288"
+      - --chunked-prefill-size
+      - "16384"
+      - --mem-fraction-static
+      - "0.9"
+      - --trust-remote-code
+      - --max-running-requests
+      - "48"
