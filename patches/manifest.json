@@ -1,0 +1,420 @@
+{
+  "schema": 1,
+  "baseline": {
+    "tag": "v0.5.22",
+    "commit": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+    "repository": "sgl-project/sglang"
+  },
+  "reviewed_at": "2026-10-27",
+  "backports": [
+    {
+      "id": "sm120-compat",
+      "title": "sm120-compat",
+      "url": null,
+      "status": "open",
+      "upstream_revision": null,
+      "merge_commit": null,
+      "note": "Existing #42371 candidate-indexer fallback and #42368 FlashInfer dispatch compatibility; both PRs remain open.",
+      "patch": "001-sm120-compat.patch",
+      "upstream_prs": [
+        42371,
+        42368
+      ],
+      "sources": [
+        {
+          "number": 42371,
+          "url": "https://github.com/sgl-project/sglang/pull/42371",
+          "revision": "2f2173c1191ad4da45fcd3046d025c6ba3707a2b",
+          "status": "open"
+        },
+        {
+          "number": 42368,
+          "url": "https://github.com/sgl-project/sglang/pull/42368",
+          "revision": "51e7ddbeaf6ccb8413169e11eeb15a6c549add84",
+          "status": "open"
+        }
+      ]
+    },
+    {
+      "id": "full-topk-triton",
+      "title": "full-topk-triton",
+      "url": null,
+      "status": "local",
+      "upstream_revision": null,
+      "merge_commit": null,
+      "note": "Preserve the previously qualified Triton paged decode route on SM12x; #45261 also fixes metadata without switching that route.",
+      "patch": "002-full-topk-triton.patch"
+    },
+    {
+      "id": "42709",
+      "title": "[Spec] Fix wrong tokens from compact-verify CUDA graphs when a token tier is captured more than once",
+      "url": "https://github.com/sgl-project/sglang/pull/42709",
+      "status": "already_in_v0.5.22",
+      "upstream_revision": "2045e4a1df3d8edddc695a4b81a925297d4a22fe",
+      "merge_commit": "438df9a2a4645d39c87e33c4a27792e568ac2701",
+      "note": "The exact shared-layout dependency is already present in the pinned v0.5.22 source.",
+      "patch": null
+    },
+    {
+      "id": "41303",
+      "title": "[Fix] deepseek-v4.1: Keep the full SWA window for short bounded-replay extends",
+      "url": "https://github.com/sgl-project/sglang/pull/41303",
+      "status": "merged",
+      "upstream_revision": "943fa6ec32361332cdd788cd3b19298ae00bec08",
+      "merge_commit": "ed8c3139f1f643544b68102cf8c44504e5e55e3d",
+      "note": "Port the short-tail window floor and request-aware prefix hold-back; keep streaming-session slot ownership.",
+      "patch": "004-41303.patch"
+    },
+    {
+      "id": "44673",
+      "title": "[Fix] deepseek-v4.1: Keep the DSpark draft SWA out of the radix tree",
+      "url": "https://github.com/sgl-project/sglang/pull/44673",
+      "status": "merged",
+      "upstream_revision": "37826e252ef812fa0e9c5a80e68fafa458733b24",
+      "merge_commit": "fad7d95a7f1a942e039f74eb2d319da29311b8cb",
+      "note": "Port draft SWA ring readers/writers, valid_from reset, commit injection and fixed memory budget. Read dspark_num_stages with getattr for the older v0.5.22 auxiliary config.",
+      "patch": "005-44673.patch"
+    },
+    {
+      "id": "42714",
+      "title": "[Fix] [SM120] dsv4: Stop CUDA graphs from writing into freed FlashMLA page-split buffers",
+      "url": "https://github.com/sgl-project/sglang/pull/42714",
+      "status": "open",
+      "upstream_revision": "9b9441d85b5f010d829023abe057baaf2bef05fb",
+      "merge_commit": null,
+      "note": "Keep size-keyed page-split output and masks alive across target/draft graph captures.",
+      "patch": "006-42714.patch"
+    },
+    {
+      "id": "45261",
+      "title": "[Fix] [NVIDIA] deepseek_v4: Use DeepGEMM paged-MQA metadata for low-ratio indexers on SM120",
+      "url": "https://github.com/sgl-project/sglang/pull/45261",
+      "status": "open",
+      "upstream_revision": "a11fc47c71df7b3721206f82263b2cef0e80307e",
+      "merge_commit": null,
+      "note": "Build valid low-ratio metadata while preserving this project's existing Triton FullTopK decode route.",
+      "patch": "007-45261.patch"
+    },
+    {
+      "id": "45381",
+      "title": "[Fix] [NVIDIA] deepseek_v4: Build the DeepGEMM schedule for the low-ratio prefill-graph indexer on SM12x",
+      "url": "https://github.com/sgl-project/sglang/pull/45381",
+      "status": "open",
+      "upstream_revision": "49b3a7b5d05aae760d153151ed784ed557af2b19",
+      "merge_commit": null,
+      "note": "Required on v0.5.22: the captured FullTopK prefill path removed by later #45783 still exists here.",
+      "patch": "008-45381.patch"
+    },
+    {
+      "id": "45745",
+      "title": "[Fix] deepseek-v4.1: score the torch indexer chunk in place",
+      "url": "https://github.com/sgl-project/sglang/pull/45745",
+      "status": "open",
+      "upstream_revision": "3458c1f1900fbbaffc237d74491f30e6f8cf288c",
+      "merge_commit": null,
+      "note": "Adapted to exact v0.5.22 context; see BACKPORTS.md for scope and validation.",
+      "patch": "009-45745.patch"
+    },
+    {
+      "id": "45083",
+      "title": "[Fix] [NVIDIA] deepseek-v4.1: Fix prefill CP (interleave) crashes on SM90/SM100/SM120",
+      "url": "https://github.com/sgl-project/sglang/pull/45083",
+      "status": "open",
+      "upstream_revision": "3e13600da9ca178835d842e97487aae0c6b40a13",
+      "merge_commit": null,
+      "note": "Match the release's DeepseekV4Model helper location, and port all four CP fixes.",
+      "patch": "010-45083.patch"
+    },
+    {
+      "id": "45301",
+      "title": "[Fix] deepseek-v4.1: Keep the padded query buffer inside decoder tail graphs",
+      "url": "https://github.com/sgl-project/sglang/pull/45301",
+      "status": "merged",
+      "upstream_revision": "117247ea2f9ba77cc8d47005553d3eed18e3a7bc",
+      "merge_commit": "472f0d540bdbbd1c51eace905780cd31752119b5",
+      "note": "Match the release's _local_attn_sink helper location and older HIP workspace annotation; retain capture flags.",
+      "patch": "011-45301.patch"
+    },
+    {
+      "id": "42718",
+      "title": "[Fix] dsv41: Run DSpark compact verify by mapping packed verify tokens to their requests",
+      "url": "https://github.com/sgl-project/sglang/pull/42718",
+      "status": "open",
+      "upstream_revision": "e238d2f6c1af43b428271cc9a33e3bf9400f3bf8",
+      "merge_commit": null,
+      "note": "Adapted to exact v0.5.22 context; see BACKPORTS.md for scope and validation.",
+      "patch": "012-42718.patch"
+    },
+    {
+      "id": "40424",
+      "title": "[Fix] dsv4: Skip DP-attention pad rows in the engram hasher and low-ratio sources",
+      "url": "https://github.com/sgl-project/sglang/pull/40424",
+      "status": "merged",
+      "upstream_revision": "720857de766ad8855286da9246418da66724596c",
+      "merge_commit": "29e78045fba1b4616e21e3d828b2c58df5e27879",
+      "note": "Adapted to exact v0.5.22 context; see BACKPORTS.md for scope and validation.",
+      "patch": "013-40424.patch"
+    },
+    {
+      "id": "45586",
+      "title": "[Fix] dsv4: Write idle SWA stores to an idle request-window layout",
+      "url": "https://github.com/sgl-project/sglang/pull/45586",
+      "status": "merged",
+      "upstream_revision": "bccd069679706aa609f7e93e082c43222ec4a263",
+      "merge_commit": "99cf403c9e84272b80cf36e7cca953d83be4b1d5",
+      "note": "Adapted to exact v0.5.22 context; see BACKPORTS.md for scope and validation.",
+      "patch": "014-45586.patch"
+    },
+    {
+      "id": "45699",
+      "title": "[Fix] dsv4: Never read attention metadata for idle SWA stores",
+      "url": "https://github.com/sgl-project/sglang/pull/45699",
+      "status": "merged",
+      "upstream_revision": "66366028d2dd259372df5066d7c809b4460b8f05",
+      "merge_commit": "17babd67b4495d6e58a6b6f43de549a284685b9f",
+      "note": "Adapted to exact v0.5.22 context; see BACKPORTS.md for scope and validation.",
+      "patch": "015-45699.patch"
+    },
+    {
+      "id": "46008",
+      "title": "[Fix] mem-cache: Retain SWA behind the replay-trimmed prefix frontier",
+      "url": "https://github.com/sgl-project/sglang/pull/46008",
+      "status": "open",
+      "upstream_revision": "5729f61e175bde3ef2b67dc3a95abb1042f4bf1b",
+      "merge_commit": null,
+      "note": "Add replay-boundary retention without importing the unrelated newer no-replay eviction formula.",
+      "patch": "016-46008.patch"
+    },
+    {
+      "id": "41275",
+      "title": "[Fix] deepseek-v4.1: Match KV capacity to physical layouts",
+      "url": "https://github.com/sgl-project/sglang/pull/41275",
+      "status": "merged",
+      "upstream_revision": "30d4772b761fb310022681a7808f6da2698e563c",
+      "merge_commit": "20ff40cb840984b034e7254ac5b9e5b154cb62c4",
+      "note": "Adapted to exact v0.5.22 context; see BACKPORTS.md for scope and validation.",
+      "patch": "017-41275.patch"
+    },
+    {
+      "id": "43363",
+      "title": "[Perf] moe: Extend FlashInfer CUTLASS MoE autotune coverage to prefill chunks",
+      "url": "https://github.com/sgl-project/sglang/pull/43363",
+      "status": "merged",
+      "upstream_revision": "8c22bb826b85525fc5001671f0ca13c9a8504245",
+      "merge_commit": "f8fd41c36e493ec762e60f447c50c88fb8af3ec1",
+      "note": "Use existing v0.5.22 runtime-context helpers. Extends startup autotune; hardware cost is unmeasured locally.",
+      "patch": "018-43363.patch"
+    }
+  ],
+  "files": {
+    "kernels/ops/attention/dsv4_attn_metadata_kernels.py": {
+      "base_sha256": "c61db505f34ad6ae6bbe98dfae01c239471d5f5e06dc0b2926cc527d53b8880b",
+      "patched_sha256": "e06b8a9e8d3bba3eeb2cbe4e0313b5bc16f172adc9b24604c74c8102d4e86957",
+      "legacy": []
+    },
+    "kernels/ops/attention/flash_mla_sm120.py": {
+      "base_sha256": "54e0d145a4a268af2ed1459abc0c98cac0b5d9a752e309f46b95ea03fa1eee29",
+      "patched_sha256": "c165c0eefd219e7d60acc2483a10cbee5b8b6fca2988c94bc8f762413f8b9044",
+      "legacy": [
+        {
+          "sha256": "9686c1b48d885f8fe9d283e0d460d0dccddb6df54870c4be1a4bb73383cf3fe5",
+          "reset_patch": "legacy-9686c1b48d885f8f.patch"
+        }
+      ]
+    },
+    "kernels/ops/speculative/dspark/dspark_attn_metadata.py": {
+      "base_sha256": "9718b4ebb5934bf3eefe57ea7ae6df888d39cd1d8894db11a2b46253513f7a22",
+      "patched_sha256": "29e8bc07bc6a928ced47c0aab03622acff78bbff2a295e505855badd578650fe",
+      "legacy": []
+    },
+    "kernels/ops/speculative/dspark/dspark_verify_window.py": {
+      "base_sha256": "13d341fa2e553815a321ab3bd88d6ddd48f64df8571a687485c03b401f6739c0",
+      "patched_sha256": "ac48b878c3347868c4da1c78a69c526738bb28acbca9ce21f28bd7b1dfe6d633",
+      "legacy": []
+    },
+    "srt/layers/attention/deepseek_v4_backend.py": {
+      "base_sha256": "fa5b728a2428a33a9f5eecbb3fd71f19eba9a765c975eba66af343d78ba1b2d6",
+      "patched_sha256": "4d441a93f6a60346687845acafa9b431bddd3e4b50baed535794edd173b9c19b",
+      "legacy": []
+    },
+    "srt/layers/attention/deepseek_v4_backend_hip_radix.py": {
+      "base_sha256": "cacb5f71f881f0e8207128cd46606ca5b15724510b42cfe2b7d436d3c4b9a808",
+      "patched_sha256": "6a77e30e9138ffcdb6bca4f086ac56eaad56c059362359092fa6da0eabb660f0",
+      "legacy": []
+    },
+    "srt/layers/attention/dsv4/dsv41_sparse.py": {
+      "base_sha256": "e28a2f80dea94ca2705524b770017f75ff201ff4d530bf6e1d1c3366b9e9a778",
+      "patched_sha256": "2dec0aa9bbfe049a0eaaf512c1e89122cb44fb361af4feadb1f13d0e5c70f723",
+      "legacy": []
+    },
+    "srt/layers/attention/dsv4/v41_indexer/__init__.py": {
+      "base_sha256": "2a859306852e351e99d140162bfaa82a4e956d26407da5473f87fbfb62c9c96d",
+      "patched_sha256": "be53781217fd196d7a71d81d0010fa341d380b093509f92ccb0f41f2f891a736",
+      "legacy": [
+        {
+          "sha256": "961e291748857fd24fe93c9464e7106f848671f14c5bb9ced5757984600d1f4b",
+          "reset_patch": "legacy-961e291748857fd2.patch"
+        },
+        {
+          "sha256": "be53781217fd196d7a71d81d0010fa341d380b093509f92ccb0f41f2f891a736",
+          "reset_patch": "legacy-be53781217fd196d.patch"
+        }
+      ]
+    },
+    "srt/layers/attention/dsv4/v41_indexer/scoring.py": {
+      "base_sha256": "0378ecf3824f1f4b8c853bad5e5531202deb53c8a392b2f599cf91f24c33818b",
+      "patched_sha256": "e023fd427feae0eff38a4e1177c1b2be2b43ab4b88dd793bdb2c665fd208e62b",
+      "legacy": [
+        {
+          "sha256": "86cf1a863575c3a52c98a9826b0007a83343367d67a8c40419149e60ba11b4c6",
+          "reset_patch": "legacy-86cf1a863575c3a5.patch"
+        }
+      ]
+    },
+    "srt/layers/attention/dsv4/v41_indexer/types.py": {
+      "base_sha256": "90e1b07d87e9a45f896b8b9a329be36167b947cebdbed9ebabbe7770c4b7415f",
+      "patched_sha256": "9da1c056716eb2c041c2e506b7717eccafc91f5464d31920236eca4f530688df",
+      "legacy": []
+    },
+    "srt/layers/cp/cp_decode_attn_tp.py": {
+      "base_sha256": "7cc2ef3000f5c99225b5187d0ae3d0368e3da9cc0c30f175c09e5cfb80f14b19",
+      "patched_sha256": "c9de72d8de53476615b9524ee76d30b3a208cf30bf72b2fc7260cb92fde3da4e",
+      "legacy": []
+    },
+    "srt/layers/engram.py": {
+      "base_sha256": "080352c54f746d5c928b5e9279eeb67bc7eada6383814420799be46c7d44ee5f",
+      "patched_sha256": "6e497bf46219bba5a54ddff691122782cba7a622f56d2bf45d95e05dc42ce23a",
+      "legacy": []
+    },
+    "srt/layers/moe/moe_runner/flashinfer_cutlass.py": {
+      "base_sha256": "652c8d72167110f448cc0a4b83b3ed6111b0d3a43bfd2f54eadf588d1dbf2cba",
+      "patched_sha256": "b01e2729d594511c5c1656810644aa525f48c29294e02313f6fa1c4afbb1e833",
+      "legacy": []
+    },
+    "srt/mem_cache/base_prefix_cache.py": {
+      "base_sha256": "d6b87103eebf39514cd571f6da03eb934e5211512242c2b383c67b128854d1be",
+      "patched_sha256": "82198d88a93a3e92d29dfff3e1dc1c68d42a52f816180dff28c4fd91f73ca5ea",
+      "legacy": []
+    },
+    "srt/mem_cache/cache_init_params.py": {
+      "base_sha256": "e984877dc21cb73a7eeeb73a69d0df0fedc6b950aca6bb5c816e857651a33da2",
+      "patched_sha256": "9bef9135bdfe9caf0b61e4596b41f57c1b5eb4bcb1286e6eea48dcd35ce59e06",
+      "legacy": []
+    },
+    "srt/mem_cache/common.py": {
+      "base_sha256": "e8d3ff0a8a0357e04e048bd18bd56f109ac59d6e44b205d366d9c617b8effc7d",
+      "patched_sha256": "8f36c27a498f1925ccad8de3dc95fc7cadd936fb8d610e3fe0952015a522e34a",
+      "legacy": []
+    },
+    "srt/mem_cache/deepseek_v4_memory_pool.py": {
+      "base_sha256": "b8ca58d3590e06ab68f9c7b7ca00bf884ba63dbc81044639ee0609abc0b007ef",
+      "patched_sha256": "238c85e0f08811fb7332f7f923ec1567fbb51a4a8135dc304e1feea6d49a1e72",
+      "legacy": []
+    },
+    "srt/mem_cache/dsv41_request_window.py": {
+      "base_sha256": "ffff69baa10d3a5452c9eb7a3f6a27f86890befad5995b3ac48561420780a3a5",
+      "patched_sha256": "060f0a4a4347b6241dacad7ba0baaa768277b527a773f14aa1c4fd83493f7bb1",
+      "legacy": []
+    },
+    "srt/mem_cache/kv_cache_builder.py": {
+      "base_sha256": "ba57bd42b22d486c92e173d8bdb9250407efc0aa0f0b095b0ce766c0374ba24d",
+      "patched_sha256": "fe0032d1ad30e26929b14b3485e978d920f2ab72ee6bae3ab248a12e2c513142",
+      "legacy": []
+    },
+    "srt/mem_cache/unified_cache/components/swa.py": {
+      "base_sha256": "66d323a23f3b4ae986538211600373edb5192783ed6b4cb8ed052fb02770c76a",
+      "patched_sha256": "6e09206672774a0ed2bb67b09e0a3c7814e4563cf11a19a2352c9578bfbfd85f",
+      "legacy": []
+    },
+    "srt/mem_cache/unified_radix_cache.py": {
+      "base_sha256": "8c82b00e0e14e5f301938dd04ac0323d4de19daa9ed6c2d52ecca80d1290b853",
+      "patched_sha256": "bfc1b6e25ce86a7ed62421e68da0add3a009e1698562d74507d8ceb101f9077e",
+      "legacy": []
+    },
+    "srt/model_executor/pool_configurator.py": {
+      "base_sha256": "6dfd8de3d605e66ca0d853bd2e5b8aa661cb2de309e9a042795343b7f66ffe8a",
+      "patched_sha256": "34e8952922f9c3a87e2c93474bff7ca82e07b1c624341689fed7d39403232d90",
+      "legacy": []
+    },
+    "srt/model_executor/runner/decode_cuda_graph_runner.py": {
+      "base_sha256": "fc3816702ccb5b3dc94bfcf2c597ee6e88351cd646d55ddf8033c936ab19974e",
+      "patched_sha256": "fc3816702ccb5b3dc94bfcf2c597ee6e88351cd646d55ddf8033c936ab19974e",
+      "legacy": []
+    },
+    "srt/models/deepseek_v4.py": {
+      "base_sha256": "eeaa3ab04c6029be913d49ea43cff7c12c97e5844735ce16ca472c3cb61b5668",
+      "patched_sha256": "6c6acbac1270564230ef585e13e8b43cd7e01158d09a7d33b2130768950972e2",
+      "legacy": []
+    },
+    "srt/session/streaming_session.py": {
+      "base_sha256": "8b822489550272d9caee8302ba4f89e1b082782d60c0474f0f847416465510be",
+      "patched_sha256": "68f22c274ae9112cc98b1394e5f7f0b1f1227119a38e11c88e3594f612a36b4d",
+      "legacy": []
+    },
+    "srt/speculative/dspark_components/dspark_kv_inject.py": {
+      "base_sha256": "32b853c6856c138933989ec98cb9125083d180e37b92544ca9e247412a69a201",
+      "patched_sha256": "6ace90047e4e9ba46593e5a8b2f5456e503b78e498bd4d884d7160bbf252689f",
+      "legacy": []
+    },
+    "srt/speculative/dspark_components/dspark_verify.py": {
+      "base_sha256": "c610653fa0001aa69ff7e2329959778e7af91dda056181d12ffdae8146462d45",
+      "patched_sha256": "47f9e76880332bc151a4bea62b179ea1cadcc8496ee97d243db949e3c7cc1721",
+      "legacy": []
+    },
+    "srt/speculative/dspark_components/dspark_worker_v2.py": {
+      "base_sha256": "e90fa94e106ea31e26d738c3364118f1f3418eab382f37b16a15fec9467113ac",
+      "patched_sha256": "cb31310f6fa1281c92078a7345b54134332285867e6e01c3bd49f0ff47e4a105",
+      "legacy": []
+    },
+    "srt/speculative/ragged_verify.py": {
+      "base_sha256": "5226da18ce2fd3e21ef32863ee4971f70c8c82ac6b6369d58b87f1eeca1ddded",
+      "patched_sha256": "e113a851588301be10615ba0675ba6c40ea797b6c7e866d51bd8f0737abffec9",
+      "legacy": []
+    }
+  },
+  "excluded": [
+    {
+      "prs": [
+        44857,
+        45040,
+        45051
+      ],
+      "reason": "not_applicable",
+      "detail": "The fixed release runs encoder replay separately; FoldedExtend and folded compressor rows do not exist. Do not introduce the later folded-replay feature solely to fix its subsequent regressions."
+    },
+    {
+      "prs": [
+        42440
+      ],
+      "reason": "already_fixed_dependency",
+      "detail": "Superseded by FlashInfer #5075, already included in the base pin 0.7.1."
+    },
+    {
+      "prs": [
+        43556,
+        44480
+      ],
+      "reason": "different_quantization_path",
+      "detail": "Block-FP8 draft MoE / per-layer runner fallback, rather than the deployed DeepSeek V4.1 Flash MXFP4 MoE plus DSpark path."
+    },
+    {
+      "prs": [
+        45851,
+        45417,
+        45262,
+        45391,
+        45264
+      ],
+      "reason": "feature_or_performance_backend",
+      "detail": "New KV formats or b12x dense backends require newer/modified FlashInfer; mHC BLOCK_K is performance tuning. These are not correctness backports for the pinned stack."
+    },
+    {
+      "prs": [
+        42445,
+        39492
+      ],
+      "reason": "covered_by_42368",
+      "detail": "The dispatch envelope correctness change is already covered. Optional padded-head latency tuning is a separate feature."
+    }
+  ]
+}

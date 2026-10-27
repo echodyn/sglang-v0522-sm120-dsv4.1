@@ -1,0 +1,269 @@
+--- a/kernels/ops/attention/dsv4_attn_metadata_kernels.py
++++ b/kernels/ops/attention/dsv4_attn_metadata_kernels.py
+@@ -439,35 +439,36 @@
+     *,
+     extend_lens_cpu: list[int],
+     seq_lens_cpu: list[int],
+     tail_len: int,
+     device: torch.device,
+ ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
+     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
+     Returns (token indices into the extend, per-request tail lengths, per-row
+-    absolute window floor)."""
++    absolute window floor). The floor is seq_len - tail_len, so a tail shorter
++    than tail_len reads rows the request wrote before this extend."""
+     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+     if len(extend_lens_cpu) == 1:
+         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
+-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
++        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
+         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
+     # One H2D copy for the three length vectors; launch count does not grow with bs.
+     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
+     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
+     total = sum(tail_lens_cpu)
+     req = torch.repeat_interleave(
+         torch.arange(len(tail_lens_cpu), device=device), tail_lens, output_size=total
+     )
+     offs = (
+         torch.arange(total, device=device)
+         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
+     )
+     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
+-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
++    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
+     return token_indices, tail_lens_cpu, floor
+ 
+ 
+ def build_causal_swa_page_indices(
+     *,
+     req_to_token: torch.Tensor,
+     full_to_swa_mapping: torch.Tensor,
+     req_pool_indices_repeated: torch.Tensor,
+--- a/srt/layers/attention/deepseek_v4_backend.py
++++ b/srt/layers/attention/deepseek_v4_backend.py
+@@ -1615,18 +1615,16 @@
+ 
+     def _build_late_layer_tail_metadata(
+         self,
+         forward_batch: ForwardBatch,
+         *,
+         for_prefill_graph: bool = False,
+         max_seq_len_override: Optional[int] = None,
+     ) -> DSV4Metadata:
+-        # Each request contributes only its last SWA_WINDOW extend tokens, with the
+-        # window floored at the tail start: window KV before it is never written here.
+         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+         seq_lens_cpu = forward_batch.seq_lens_cpu
+         assert extend_lens_cpu is not None and seq_lens_cpu is not None
+         device = forward_batch.out_cache_loc.device
+         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
+             extend_lens_cpu=extend_lens_cpu,
+             seq_lens_cpu=seq_lens_cpu.tolist(),
+             tail_len=SWA_WINDOW,
+--- a/srt/layers/attention/deepseek_v4_backend_hip_radix.py
++++ b/srt/layers/attention/deepseek_v4_backend_hip_radix.py
+@@ -2080,18 +2080,17 @@
+         )
+ 
+     # ---- decoder SWA bounded replay ---------------------------------------
+ 
+     def _build_late_layer_tail_metadata(
+         self, forward_batch: ForwardBatch
+     ) -> DSV4Metadata:
+         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
+-        replay: each request's last SWA_WINDOW extend tokens, whose window is floored at the
+-        tail start since no window KV before it is written at those layers."""
++        replay: each request's last SWA_WINDOW extend tokens."""
+         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+         seq_lens_cpu = forward_batch.seq_lens_cpu
+         assert extend_lens_cpu is not None and seq_lens_cpu is not None
+         device = forward_batch.out_cache_loc.device
+         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
+             extend_lens_cpu=extend_lens_cpu,
+             seq_lens_cpu=seq_lens_cpu.tolist(),
+             tail_len=SWA_WINDOW,
+--- a/srt/mem_cache/base_prefix_cache.py
++++ b/srt/mem_cache/base_prefix_cache.py
+@@ -671,20 +671,18 @@
+ 
+     def swa_retain_floor(self, req) -> int | None:
+         # A match lands on a state checkpoint rather than on the tail, so a cache
+         # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+         # the last checkpoint. Those caches override this. Everyone else has
+         # nothing deeper than the tail to protect.
+         return None
+ 
+-    def swa_reprefill_tail_tokens(self) -> int:
+-        # Only the unified_kv compress-only HiCache layout needs to hold back a
+-        # trailing sliding window for re-prefill; every other cache keeps SWA
+-        # content-stable and overrides this where relevant.
++    def swa_reprefill_tail_tokens(self, req=None) -> int:
++        # Caches whose matched SWA is not reusable as is override this.
+         return 0
+ 
+     def supports_mamba(self) -> bool:
+         return False
+ 
+     def release_session(self, session_id: str) -> None:
+         pass
+ 
+--- a/srt/mem_cache/cache_init_params.py
++++ b/srt/mem_cache/cache_init_params.py
+@@ -46,16 +46,17 @@
+     pp_size: int = 1
+ 
+     attn_cp_rank: int = 0
+     attn_cp_size: int = 1
+ 
+     chunked_prefill_size: Optional[int] = None
+ 
+     sliding_window_size: Optional[int] = None
++    decoder_swa_bounded_replay: bool = False
+ 
+     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
+     cache_ttl_seconds: Optional[float] = None
+ 
+     tree_components: Optional[tuple[ComponentType, ...]] = None
+     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
+         None
+     )
+--- a/srt/mem_cache/common.py
++++ b/srt/mem_cache/common.py
+@@ -173,19 +173,19 @@
+ 
+ 
+ def _req_radix_key(
+     tree_cache: BasePrefixCache,
+     req: Req,
+     token_ids: array[int],
+     max_prefix_len: Optional[int] = None,
+ ) -> RadixKey:
+-    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
+-    # prefix carries stale SWA; cap the match so the window is re-prefilled.
+-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
++    # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
++    # bounded replay); cap the match so the window is re-prefilled.
++    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
+     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+     if max_prefix_len is not None:
+         key_limit = (
+             max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+         )
+     return RadixKey(
+         token_ids=token_ids,
+         extra_key=req.extra_key,
+--- a/srt/mem_cache/kv_cache_builder.py
++++ b/srt/mem_cache/kv_cache_builder.py
+@@ -349,16 +349,17 @@
+         eviction_policy_config=get_memory().radix_eviction_policy_config,
+         enable_metrics=enable_metrics,
+         enable_kv_cache_events=enable_kv_cache_events,
+         dynamo_kv_event_format=dynamo_kv_event_format,
+         kv_event_lora_names=kv_event_lora_names,
+         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
++        decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
+         pp_rank=parallel.pp_rank,
+         pp_size=parallel.pp_size,
+         attn_cp_rank=parallel.attn_cp_rank,
+         attn_cp_size=parallel.attn_cp_size,
+         chunked_prefill_size=effective_chunked_prefill_size,
+         sliding_window_size=sliding_window_size,
+         mtp_draft_device_pools=mtp_draft_device_pools,
+         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
+--- a/srt/mem_cache/unified_radix_cache.py
++++ b/srt/mem_cache/unified_radix_cache.py
+@@ -210,16 +210,17 @@
+         # Whether the mamba extra (ping-pong) buffer is enabled.
+         self.enable_mamba_extra_buffer = (
+             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
+         )
+         # SWA window size (None when SWA is not enabled).
+         self._sliding_window_size = (
+             params.sliding_window_size if self.is_swa_enabled else None
+         )
++        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
+         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
+         # evictable leaves) and drives the components' tree-level hooks.
+         self._tree_core_backend = select_tree_core_backend(params)
+         # A disabled tree holds nothing, so it reports no KV events and never
+         # evicts; its eviction policy config is not built or validated.
+         tree_params = (
+             replace(
+                 params,
+@@ -3594,35 +3595,35 @@
+     # ---- Query / Inspection APIs ----
+     # These APIs exist for compatibility with other RadixTree implementations.
+     # TODO: simplify and consolidate in a future refactor.
+ 
+     @property
+     def sliding_window_size(self):
+         return self._sliding_window_size
+ 
+-    def swa_reprefill_tail_tokens(self) -> int:
+-        """
+-        Only unified_kv needs this: SWA lives in a per-request ring
+-        (state_slot/pos), not content-stable and never stored in the tree, so a
+-        reused prefix's trailing sliding window would read another request's
+-        stale ring slots. Re-prefilling that window rewrites this request's ring.
+-
+-        Applies to plain radix reuse as well as HiCache -- the ring is stale
+-        either way. Returns 0 once SWA has a host pool to restore exact contents
+-        from, and for every non-unified_kv layout, whose SWA slots are
+-        content-stable.
++    def swa_reprefill_tail_tokens(self, req=None) -> int:
++        """Tokens at the end of a matched prefix to re-prefill because their SWA
++        cannot be reused as is.
++
++        unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
++        stores, so a reused window would read another request's stale slots; a
++        host pool restores exact contents instead. Decoder SWA bounded replay
++        writes late-layer window KV only for an extend's tail rows, so a matched
++        prefix may lack it; a streaming turn borrowing its own record has it.
+         """
+         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+             is_unified_kv_triton,
+         )
+ 
+         swa = self.components.get(ComponentType.SWA)
+         if swa is None or not swa.sliding_window_size:
+             return 0
++        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
++            return swa.sliding_window_size
+         if not is_unified_kv_triton():
+             return 0
+         if self.tree_core.has_swa_host_pool:
+             return 0
+         return swa.sliding_window_size
+ 
+     def swa_retain_floor(self, req) -> int | None:
+         if not self.is_mamba_enabled or self._sliding_window_size is None:
+--- a/srt/session/streaming_session.py
++++ b/srt/session/streaming_session.py
+@@ -80,16 +80,24 @@
+         if slot is None or not slot.kv.holds_kv:
+             return None
+         if req.to_finish is not None:
+             req.release_mm_inputs_on_abort()
+             req.session.abort_req()
+             req.session = None
+             return None
+         return slot
++
++    def will_lend_record(self, req: Optional[Req]) -> bool:
++        """Whether req has a slot record to borrow. Unlike find_active_slot, it
++        leaves a pre-aborted req attached."""
++        if not _is_streaming(req) or req.to_finish is not None:
++            return False
++        slot = self.slots.get(req.session.session_id)
++        return slot is not None and slot.kv.holds_kv
+ 
+     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
+         """Returns a MatchResult iff the request hits an active session slot;
+         otherwise None (caller falls back to its raw match)."""
+         slot = self.find_active_slot(params.req)
+         if slot is None:
+             return None
+ 

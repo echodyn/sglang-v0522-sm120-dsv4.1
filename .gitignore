@@ -1,2 +1,5 @@
 .DS_Store
 .zcode/
+__pycache__/
+.pytest_cache/
+.cache/

@@ -1,0 +1,927 @@
+--- a/kernels/ops/speculative/dspark/dspark_attn_metadata.py
++++ b/kernels/ops/speculative/dspark/dspark_attn_metadata.py
+@@ -406,16 +406,93 @@
+         swa_window,
+         block_size,
+         target_width,
+         TW_BLOCK=TW_BLOCK,
+     )
+     return swa_page_indices, swa_topk_lengths
+ 
+ 
++def swa_ring_rows(
++    slots: torch.Tensor, positions: torch.Tensor, ring_size: int
++) -> torch.Tensor:
++    """Row of ``positions`` in a per-request SWA ring: request slot ``s`` keeps
++    position ``p`` at row ``s * ring_size + p % ring_size``."""
++    return slots.to(torch.int64) * ring_size + positions.to(torch.int64) % ring_size
++
++
++class BuildDsparkSwaRingIndices:
++    """``BuildDsparkSwaPageIndices`` over a per-request SWA ring (`swa_ring_rows`),
++    with each request's window starting no earlier than its ``valid_from``."""
++
++    @classmethod
++    def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
++        return cls.torch(*args, **kwargs)
++
++    @classmethod
++    def torch(
++        cls,
++        *,
++        seq_lens_casual: torch.Tensor,
++        req_pool_indices_repeated: torch.Tensor,
++        valid_from: torch.Tensor,
++        ring_size: int,
++        block_size: int,
++        swa_window: int,
++        page_index_aligned_size: int,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        num_q = seq_lens_casual.size(0)
++        assert num_q % block_size == 0, (
++            f"DSpark draft block forward must be uniform-gamma: num_q={num_q} not "
++            f"divisible by block_size={block_size}."
++        )
++        bs = num_q // block_size
++        device = seq_lens_casual.device
++        first_token = torch.arange(bs, device=device, dtype=torch.int64) * block_size
++        prefix_lens = seq_lens_casual[first_token].to(torch.int64) - 1
++        slots = req_pool_indices_repeated[first_token].to(torch.int64).view(-1, 1)
++        start = torch.maximum(
++            prefix_lens - swa_window, valid_from[slots.view(-1)]
++        ).clamp_(min=0)
++        context_lens = (prefix_lens - start).clamp_(min=0)
++
++        cols = torch.arange(swa_window, device=device, dtype=torch.int64).view(1, -1)
++        window_rows = swa_ring_rows(slots, start.view(-1, 1) + cols, ring_size)
++        window_rows = torch.where(cols < context_lens.view(-1, 1), window_rows, -1)
++        block_offsets = torch.arange(block_size, device=device, dtype=torch.int64)
++        block_rows = swa_ring_rows(
++            slots, prefix_lens.view(-1, 1) + block_offsets.view(1, -1), ring_size
++        )
++
++        target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
++        out = torch.full((bs, target_width), -1, dtype=torch.int32, device=device)
++        out[:, :swa_window] = window_rows.to(torch.int32)
++        out.scatter_(
++            1,
++            context_lens.view(-1, 1) + block_offsets.view(1, -1),
++            block_rows.to(torch.int32),
++        )
++
++        swa_page_indices = (
++            out.view(bs, 1, target_width)
++            .expand(bs, block_size, target_width)
++            .reshape(bs * block_size, target_width)
++            .contiguous()
++        )
++        swa_topk_lengths = (
++            (context_lens + block_size)
++            .view(bs, 1)
++            .expand(bs, block_size)
++            .reshape(bs * block_size)
++            .contiguous()
++            .to(torch.int32)
++        )
++        return swa_page_indices, swa_topk_lengths
++
++
+ class BuildBlockSeqLensCausal:
+     @classmethod
+     def execute(cls, *args, **kwargs) -> torch.Tensor:
+         if inputs_on_cuda(*args, **kwargs):
+             return cls.triton(*args, **kwargs)
+         return cls.torch(*args, **kwargs)
+ 
+     @classmethod
+--- a/kernels/ops/speculative/dspark/dspark_verify_window.py
++++ b/kernels/ops/speculative/dspark/dspark_verify_window.py
+@@ -2,16 +2,17 @@
+ 
+ import msgspec
+ import torch
+ import triton
+ import triton.language as tl
+ 
+ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+ from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
++from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+ from sglang.srt.utils import (
+     is_npu,
+ )
+ 
+ _is_npu = is_npu()
+ 
+@@ -615,41 +616,41 @@
+     )
+ 
+ 
+ class CommitInjectLayoutResult(msgspec.Struct):
+     swa_loc: torch.Tensor
+     positions: torch.Tensor
+ 
+ 
+-def build_unified_commit_inject_layout(
++def build_ring_commit_inject_layout(
+     *,
+     req_pool_indices: torch.Tensor,
+     prefix_lens: torch.Tensor,
+     block_pos_offsets: torch.Tensor,
+     commit_lens: torch.Tensor,
+     stride: int,
+     ring_stride: int,
+ ) -> CommitInjectLayoutResult:
+-    """unified_kv counterpart of build_commit_inject_layout.
+-
+-    Non-unified injection translates the verify tokens' full cache locs through
+-    ``full_to_swa_mapping``; under unified_kv the SWA K lives in a ring addressed
+-    directly by ``state_slot * ring_stride + pos % ring_stride``, so compute the
+-    ring row here instead. Uncommitted tokens (col >= commit_len) get loc = -1 and
+-    are skipped by the scatter. All ops are static-shape (CUDA-graph safe).
++    """Per-request SWA ring counterpart of build_commit_inject_layout.
++
++    Paged injection translates the verify tokens' full cache locs through
++    ``full_to_swa_mapping``; a per-request ring is addressed directly by
++    `swa_ring_rows`, so compute the ring row here instead. Uncommitted tokens
++    (col >= commit_len) get loc = -1 and are skipped by the scatter. All ops are
++    static-shape (CUDA-graph safe).
+     """
+     bs = req_pool_indices.shape[0]
+     device = req_pool_indices.device
+     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
+     positions = positions_2d.reshape(-1).to(torch.int64)
+     state_slot = (
+         req_pool_indices.to(torch.int64).view(-1, 1).expand(bs, stride).reshape(-1)
+     )
+-    loc = state_slot * ring_stride + positions % ring_stride
++    loc = swa_ring_rows(state_slot, positions, ring_stride)
+     col = torch.arange(stride, device=device).view(1, -1)
+     committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+     swa_loc = torch.where(committed, loc, torch.full_like(loc, -1)).to(torch.int32)
+     return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+ 
+ 
+ class BuildCommitInjectLayout:
+     @classmethod
+--- a/srt/layers/attention/deepseek_v4_backend.py
++++ b/srt/layers/attention/deepseek_v4_backend.py
+@@ -41,17 +41,19 @@
+     BuildCausalSwaPageIndices,
+     BuildPageTablePositions,
+     ExpandPrefillCausally,
+     late_layer_tail_layout,
+ )
+ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+     BuildBlockSeqLensCausal,
+     BuildDsparkSwaPageIndices,
++    BuildDsparkSwaRingIndices,
+     ComputeDsparkWindowGather,
++    swa_ring_rows,
+ )
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.base_attn_backend import (
+     AttentionBackend,
+     SharedReadEnds,
+ )
+ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+@@ -2282,17 +2284,20 @@
+                 # Multi-step draft decode shares one out_cache_loc buffer across
+                 # steps; mirror the eager init's per-step slice.
+                 out_cache_loc = per_step_draft_out_cache_loc(
+                     out_cache_loc,
+                     forward_batch.batch_size,
+                     self.topk,
+                     self.speculative_num_steps,
+                 )[self.speculative_step_id]
+-            if self.token_to_kv_pool.request_window is None:
++            if (
++                self.token_to_kv_pool.request_window is None
++                and self.token_to_kv_pool.swa_req_ring_size is None
++            ):
+                 metadata.core_attn_metadata.swa_out_cache_loc = (
+                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                         out_cache_loc
+                     ).to(torch.int32)
+                 )
+ 
+             # Refresh low-ratio source metadata from the live decode inputs.
+             if (
+@@ -2320,16 +2325,23 @@
+                 ) = self.get_dspark_swa_page_indices(
+                     seq_lens_casual=seq_lens_casual,
+                     req_pool_indices_repeated=req_pool_indices_repeated,
+                     out_loc=out_cache_loc,
+                     block_size=block_size,
+                 )
+                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
+                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
++                if self.token_to_kv_pool.swa_req_ring_size is not None:
++                    metadata.core_attn_metadata.swa_out_cache_loc = (
++                        self._dspark_swa_ring_out_cache_loc(
++                            seq_lens_casual=seq_lens_casual,
++                            req_pool_indices_repeated=req_pool_indices_repeated,
++                        )
++                    )
+                 if self.trtllm_attn:
+                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
+ 
+     def _dspark_seq_lens_casual(
+         self, *, seq_lens: torch.Tensor, block_size: int
+     ) -> torch.Tensor:
+         return BuildBlockSeqLensCausal.execute(
+             seq_lens=seq_lens,
+@@ -4198,16 +4210,17 @@
+             max_seq_len=max_seq_len,
+             page_size=self.page_size,
+             swa_window=SWA_WINDOW,
+         )
+         seq_lens_casual = prep.seq_lens_casual
+ 
+         raw_positions = prep.positions_casual
+         request_layout = None
++        swa_out_cache_loc = None
+         if self.token_to_kv_pool.request_window is not None:
+             from sglang.srt.mem_cache.dsv41_request_window import window_layout
+ 
+             if self.encoder_replay:
+                 starts = torch.ones_like(raw_positions, dtype=torch.bool)
+                 starts[1:] = (
+                     req_pool_indices_repeated[1:] != req_pool_indices_repeated[:-1]
+                 )
+@@ -4220,16 +4233,17 @@
+                 req_pool_indices_repeated,
+                 raw_positions,
+                 capacity=self.token_to_kv_pool.request_window.capacity,
+                 floor=swa_replay_start,
+                 num_groups=num_groups,
+             )
+             swa_page_indices = _pad_last_dim(request_layout.indices)
+             swa_topk_lengths = request_layout.lengths
++            swa_out_cache_loc = request_layout.write_loc
+         elif dspark_block_size is not None:
+             assert (
+                 self.is_dspark_draft
+                 and dspark_block_size == self.speculative_num_draft_tokens - 1
+             ), (
+                 f"dspark_block_size={dspark_block_size} must equal gamma = "
+                 f"speculative_num_draft_tokens-1={self.speculative_num_draft_tokens - 1} "
+                 f"and is only valid on the DSpark draft backend "
+@@ -4242,16 +4256,21 @@
+                 swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
+                     seq_lens_casual=seq_lens_casual,
+                     req_pool_indices_repeated=req_pool_indices_repeated,
+                     out_loc=out_loc,
+                     block_size=dspark_block_size,
+                 )
+             else:
+                 swa_page_indices, swa_topk_lengths = dspark_swa_buffers
++            if self.token_to_kv_pool.swa_req_ring_size is not None:
++                swa_out_cache_loc = self._dspark_swa_ring_out_cache_loc(
++                    seq_lens_casual=seq_lens_casual,
++                    req_pool_indices_repeated=req_pool_indices_repeated,
++                )
+         else:
+             swa_page_indices = BuildCausalSwaPageIndices.execute(
+                 req_to_token=self.req_to_token,
+                 full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+                 req_pool_indices_repeated=req_pool_indices_repeated,
+                 seq_lens_casual=seq_lens_casual,
+                 swa_window=SWA_WINDOW,
+                 page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+@@ -4275,19 +4294,17 @@
+             positions_casual=raw_positions,
+             page_table=page_table,
+             swa_page_indices=swa_page_indices,
+             swa_topk_lengths=swa_topk_lengths,
+             index_topk=self.index_topk,
+             present_ratios=self.present_ratios,
+             low_ratios=self.low_ratios,
+             request_window_layout=request_layout,
+-            swa_out_cache_loc=(
+-                request_layout.write_loc if request_layout is not None else None
+-            ),
++            swa_out_cache_loc=swa_out_cache_loc,
+         )
+ 
+         if need_compress:
+             low_ratio_buffers = (
+                 build_low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                 if small_metadata
+                 else None
+             )
+@@ -4311,16 +4328,27 @@
+     def get_dspark_swa_page_indices(
+         self,
+         *,
+         seq_lens_casual: torch.Tensor,
+         req_pool_indices_repeated: torch.Tensor,
+         out_loc: torch.Tensor,
+         block_size: int,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
++        pool = self.token_to_kv_pool
++        if pool.swa_req_ring_size is not None:
++            return BuildDsparkSwaRingIndices.execute(
++                seq_lens_casual=seq_lens_casual,
++                req_pool_indices_repeated=req_pool_indices_repeated,
++                valid_from=pool.swa_req_ring_valid_from,
++                ring_size=pool.swa_req_ring_size,
++                block_size=block_size,
++                swa_window=SWA_WINDOW,
++                page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
++            )
+         gather = ComputeDsparkWindowGather.execute(
+             seq_lens_casual=seq_lens_casual,
+             req_pool_indices_repeated=req_pool_indices_repeated,
+             block_size=block_size,
+             swa_window=SWA_WINDOW,
+         )
+ 
+         swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
+@@ -4331,16 +4359,27 @@
+             invalid=gather.invalid,
+             out_loc=out_loc[: gather.num_q],
+             context_lens=gather.context_lens,
+             block_size=block_size,
+             swa_window=SWA_WINDOW,
+             page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+         )
+         return swa_page_indices, swa_topk_lengths
++
++    def _dspark_swa_ring_out_cache_loc(
++        self, *, seq_lens_casual: torch.Tensor, req_pool_indices_repeated: torch.Tensor
++    ) -> torch.Tensor:
++        """Ring rows the draft block writes: row ``i`` sits at position
++        ``seq_lens_casual[i] - 1`` of its request."""
++        return swa_ring_rows(
++            req_pool_indices_repeated,
++            seq_lens_casual.to(torch.int64) - 1,
++            self.token_to_kv_pool.swa_req_ring_size,
++        ).to(torch.int32)
+ 
+ 
+ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
+     def __init__(
+         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+     ):
+         super().__init__(model_runner)
+         self.model_runner = model_runner
+--- a/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -105,16 +105,28 @@
+     return sources_by_ratio
+ 
+ 
+ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+     """Largest draft-token count this ring can serve; mirrors `mtp_pad` in
+     `c_plan.cuh`, where the bound is derived."""
+     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+     return ring_size - window_size + 2 if ring_size > window_size else 0
++
++
++def uses_draft_swa_ring() -> bool:
++    """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
++    state is tree-owned under encoder replay. The HIP backend still addresses the
++    draft SWA through the target's paged full-to-SWA mapping."""
++    return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
++
++
++def get_draft_swa_ring_size(sliding_window: int, max_draft_tokens: int) -> int:
++    # A draft block and a verify commit write past the committed window.
++    return sliding_window + max_draft_tokens
+ 
+ 
+ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
+     # A verify batch writes its draft tokens ahead of the committed position.
+     spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+     return sliding_window + spec_extra
+ 
+ 
+@@ -1076,23 +1088,24 @@
+         self.qk_rope_head_dim = qk_rope_head_dim
+         self.indexer_head_dim = indexer_head_dim
+ 
+         stage_layer_num = len(stage_ratios)
+         kv_pool_cls: type = DeepSeekV4SingleKVPool
+ 
+         self.request_window = None
+         self.full_to_swa_index_mapping = None
++        # Per req slot, the first position the draft SWA ring holds KV for.
++        self.swa_req_ring_valid_from: Optional[torch.Tensor] = None
+         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+-        # DSpark's draft shares the target's full-to-SWA mapping, so the target
+-        # keeps its paged SWA allocator even under encoder replay.
+-        self.needs_paged_swa_allocator = (
+-            not encoder_replay
+-            or is_draft_worker
+-            or get_spec().speculative_algorithm is not None
++        # Under encoder replay the target keeps SWA in a per-request window. A
++        # draft without its own ring still reads the target's full-to-SWA mapping,
++        # so the target then keeps its paged SWA allocator.
++        self.needs_paged_swa_allocator = not encoder_replay or (
++            not uses_draft_swa_ring() and get_spec().speculative_algorithm is not None
+         )
+         if encoder_replay and not is_draft_worker:
+             from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
+ 
+             def make_window_pool(size, layers):
+                 return self._make_kv_pool(
+                     size=size,
+                     page_size=swa_page_size,
+@@ -1115,16 +1128,37 @@
+                 layers=stage_layer_num,
+                 page_size=swa_page_size,
+                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
+                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
+                 + max(
+                     chunk,
+                     (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
+                 ),
++            )
++        elif uses_draft_swa_ring():
++            # The DSpark draft writes SWA rows only from target hidden states, never
++            # while attending, so it addresses its ring directly with no workspace.
++            self.unified_kv_pool = None
++            self.swa_req_ring_size = get_draft_swa_ring_size(
++                self.sliding_window, online_mtp_max_draft_tokens or 0
++            )
++            self.swa_req_ring_valid_from = torch.zeros(
++                self.num_req_slots, dtype=torch.int64, device=device
++            )
++            self.swa_kv_pool = self._make_kv_pool(
++                size=self.num_req_slots * self.swa_req_ring_size,
++                page_size=swa_kv_page_size,
++                dtype=dtype,
++                layer_num=stage_layer_num,
++                device=device,
++                enable_memory_saver=enable_memory_saver,
++                global_page_size=swa_page_size,
++                kv_layout=self.kv_layout,
++                cls=kv_pool_cls,
+             )
+         elif self._unified_kv:
+             assert self.kv_layout is KVLayout.V4, (
+                 "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
+             )
+             self.swa_kv_pool = None
+             swa_ring_size = get_swa_ring_size(
+                 self.sliding_window, get_spec().speculative_algorithm is not None
+@@ -1162,20 +1196,26 @@
+                 layer_num=stage_layer_num,
+                 device=device,
+                 enable_memory_saver=enable_memory_saver,
+                 global_page_size=swa_page_size,
+                 kv_layout=self.kv_layout,
+                 cls=kv_pool_cls,
+             )
+ 
++        if self.request_window is not None:
++            swa_storage = "request_window"
++        elif self.swa_req_ring_size is not None:
++            swa_storage = "ring"
++        else:
++            swa_storage = "paged"
+         logger.info(
+             "DSV4 SWA storage: worker=%s, storage=%s, paged_allocator=%s",
+             "draft" if is_draft_worker else "target",
+-            "request_window" if self.request_window is not None else "paged",
++            swa_storage,
+             self.needs_paged_swa_allocator,
+         )
+         self.full_size = full_size
+         self.kv_source_layers = list(kv_source_layers)
+         self.sources_by_ratio = collect_sources_by_ratio(
+             self.compression_ratios,
+             self.kv_source_layers,
+             range(self._stage_start, self._stage_end),
+@@ -1215,16 +1255,21 @@
+         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+ 
+     def get_ring_size(self, compress_ratio: int) -> int:
+         return resolve_compress_state_ring_size(compress_ratio)
+ 
+     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+         assert self.full_to_swa_index_mapping is not None
+         return self.full_to_swa_index_mapping[kv_indices]
++
++    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
++        """Restart the draft SWA ring of ``slots`` at ``valid_from``; the rows
++        before it belong to the slot's previous owner, not this request."""
++        self.swa_req_ring_valid_from[slots] = valid_from
+ 
+     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+         data_ptrs: List[int] = []
+         data_lens: List[int] = []
+         item_lens: List[int] = []
+ 
+         def append_page_buffer(buf: torch.Tensor) -> None:
+             assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+--- a/srt/model_executor/pool_configurator.py
++++ b/srt/model_executor/pool_configurator.py
+@@ -29,19 +29,21 @@
+     is_deepseek_v4,
+     is_minimax_sparse,
+ )
+ from sglang.srt.environ import envs
+ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+     collect_sources_by_ratio,
+     get_compress_state_write_pad,
++    get_draft_swa_ring_size,
+     get_dsv4_indexer_bytes_per_token,
+     get_swa_ring_size,
+     resolve_compress_state_ring_size,
++    uses_draft_swa_ring,
+ )
+ from sglang.srt.mem_cache.memory_pool import (
+     DSATokenToKVPool,
+     get_minimax_sparse_index_dtype,
+ )
+ from sglang.srt.mem_cache.page_interleave import compute_page_shard_scratch_bytes
+ from sglang.srt.runtime_context import (
+     get_disagg,
+@@ -1166,42 +1168,54 @@
+ 
+         if self.is_speculative:
+             # Ring is sized once here, so it must serve the largest adaptive tier.
+             self._assert_ring_serves_draft_tokens(
+                 max_speculative_num_draft_tokens() or 0
+             )
+ 
+         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+-        self.paged_draft_layers = 0
++        draft_layers = 0
+         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
+-            self.paged_draft_layers = int(
+-                kvc.spec_aux_config.dflash_draft_num_layers or 0
+-            )
+-            assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
++            aux = kvc.spec_aux_config
++            draft_layers = int(
++                getattr(aux, "dspark_num_stages", None)
++                or aux.dflash_draft_num_layers
++                or 0
++            )
++            assert draft_layers > 0, "DSpark draft layer count is required"
++        # A draft SWA ring is budgeted with the request windows, not per SWA token.
++        draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
++        self.paged_draft_layers = draft_layers - draft_ring_layers
+         self.request_window_bytes = 0
+         if self.encoder_replay:
+             slots = self.requested_max_running_requests_per_worker + 1
+             capacity = ceil_align(
+                 self.sliding_window_size + self.online_c128_mtp_max_draft_tokens,
+                 self.page_size,
+             )
+             layers = self.num_layers_total
+             scratch = (
+                 max(
+                     get_schedule().chunked_prefill_size,
+                     slots * max(128, self.online_c128_mtp_max_draft_tokens),
+                 )
+                 + slots * 128
+                 + self.page_size
+             )
++            draft_ring_size = get_draft_swa_ring_size(
++                self.sliding_window_size, self.online_c128_mtp_max_draft_tokens
++            )
+             self.request_window_bytes = (
+                 (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)
+                 + 4 * scratch * (self.kv_bytes + 16)
+                 + slots * 3 * 16 * self.attn_head_dim * 8
++                + (slots * draft_ring_size + self.page_size)
++                * draft_ring_layers
++                * self.kv_bytes
+             )
+             if not self.paged_draft_layers:
+                 self.swa_ratio = 0
+         self.swa_prefix_tails = self._resolve_swa_prefix_tails()
+         self.swa_cap_tokens = (
+             0
+             if self.encoder_replay and not self.paged_draft_layers
+             else self._resolve_swa_cap_tokens()
+--- a/srt/speculative/dspark_components/dspark_kv_inject.py
++++ b/srt/speculative/dspark_components/dspark_kv_inject.py
+@@ -1,18 +1,16 @@
+ from typing import Optional
+ 
+ import torch
+ 
+-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+-    is_unified_kv_triton,
+-)
++from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
+ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+     BuildCommitInjectLayout,
+-    build_unified_commit_inject_layout,
++    build_ring_commit_inject_layout,
+ )
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+ 
+ 
+ class TargetHiddenKvInjector:
+     def __init__(
+@@ -26,16 +24,23 @@
+         block_pos_offsets: torch.Tensor,
+     ) -> None:
+         self.draft_model = draft_model
+         self.draft_model_runner = draft_model_runner
+         self.model_runner = model_runner
+         self.device = device
+         self.verify_num_draft_tokens = verify_num_draft_tokens
+         self._block_pos_offsets = block_pos_offsets
++
++    @property
++    def swa_ring_size(self) -> Optional[int]:
++        """The ring length when the draft's SWA KV is a per-request ring."""
++        return getattr(
++            self.draft_model_runner.token_to_kv_pool, "swa_req_ring_size", None
++        )
+ 
+     def ids_for(self, plan: KVLocPlan, *, cols: Optional[Cols] = None) -> torch.Tensor:
+         """The plan's write ids as the draft pool indexes them: the target's
+         physical ids for a fused draft, the virtual ids for a private one."""
+         return plan.write_ids(self.draft_model_runner.kv_index_translator, cols=cols)
+ 
+     def inject_target_hidden(
+         self,
+@@ -113,18 +118,18 @@
+         target_hidden: torch.Tensor,
+         cache_loc: torch.Tensor,
+         positions: torch.Tensor,
+         cache_loc_2d: Optional[torch.Tensor],
+         commit_lens: Optional[torch.Tensor],
+         state_slot: Optional[torch.Tensor] = None,
+         final_pos: Optional[torch.Tensor] = None,
+     ) -> None:
+-        if is_unified_kv_triton():
+-            swa_loc = self._unified_inject_loc(
++        if pool.swa_req_ring_size is not None:
++            swa_loc = self._ring_inject_loc(
+                 pool=pool,
+                 positions=positions,
+                 cache_loc_2d=cache_loc_2d,
+                 commit_lens=commit_lens,
+                 state_slot=state_slot,
+                 final_pos=final_pos,
+             )
+         elif (
+@@ -160,43 +165,43 @@
+         with torch.inference_mode():
+             self.draft_model.write_target_hidden_kv(
+                 main_hidden=target_hidden,
+                 swa_loc=swa_loc,
+                 positions=positions,
+                 pool=pool,
+             )
+ 
+-    def _unified_inject_loc(
++    def _ring_inject_loc(
+         self,
+         *,
+         pool,
+         positions: torch.Tensor,
+         cache_loc_2d: Optional[torch.Tensor],
+         commit_lens: Optional[torch.Tensor],
+         state_slot: Optional[torch.Tensor],
+         final_pos: Optional[torch.Tensor],
+     ) -> torch.Tensor:
+-        """Ring row for target-hidden injection under unified_kv.
+-
+-        loc = state_slot * ring + pos % ring, with two skip (-1) rules:
++        """Ring row for target-hidden injection into a per-request SWA ring.
++
++        loc = swa_ring_rows(state_slot, pos, ring), with two skip (-1) rules:
+           * SWA window: only the last ``win`` tokens per req land in the ring;
+             older tokens share a ring slot (pos % ring) and would race, so drop
+             them (needed for long prefill chunks).
+           * commit gate: uncommitted verify tokens (col >= commit_len) are dropped.
+         """
+         if state_slot is None:
+             raise RuntimeError(
+-                "unified_kv target-hidden injection requires state_slot "
++                "SWA ring target-hidden injection requires state_slot "
+                 "(per-token draft req_pool_indices)."
+             )
+-        ring = pool.unified_swa_ring_size
+-        win = pool.unified_swa_window
++        ring = pool.swa_req_ring_size
++        win = pool.sliding_window
+         pos = positions.to(torch.int64)
+-        loc = state_slot.to(torch.int64) * ring + pos % ring
++        loc = swa_ring_rows(state_slot, pos, ring)
+         if final_pos is not None:
+             keep = pos > (final_pos.to(torch.int64) - win)
+             loc = torch.where(keep, loc, torch.full_like(loc, -1))
+         if commit_lens is not None and cache_loc_2d is not None:
+             bs, verify_len = cache_loc_2d.shape
+             col = torch.arange(verify_len, device=positions.device).view(1, -1)
+             committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+             loc = torch.where(committed, loc, torch.full_like(loc, -1))
+@@ -215,24 +220,24 @@
+         stride = self.verify_num_draft_tokens
+         prefix_lens = batch.seq_lens
+         hidden = hidden_strided.view(bs, stride, -1)
+ 
+         pool = self.draft_model_runner.token_to_kv_pool
+         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+             if hidden_strided.numel() == 0:
+                 return
+-            if is_unified_kv_triton():
+-                inject_layout = build_unified_commit_inject_layout(
++            if pool.swa_req_ring_size is not None:
++                inject_layout = build_ring_commit_inject_layout(
+                     req_pool_indices=batch.req_pool_indices,
+                     prefix_lens=prefix_lens,
+                     block_pos_offsets=self._block_pos_offsets[:stride],
+                     commit_lens=commit_lens,
+                     stride=stride,
+-                    ring_stride=pool.unified_swa_ring_size,
++                    ring_stride=pool.swa_req_ring_size,
+                 )
+             else:
+                 inject_layout = BuildCommitInjectLayout.execute(
+                     req_pool_indices=batch.req_pool_indices,
+                     req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                     prefix_lens=prefix_lens,
+                     block_pos_offsets=self._block_pos_offsets[:stride],
+                     full_to_swa_mapping=pool.full_to_swa_index_mapping,
+--- a/srt/speculative/dspark_components/dspark_verify.py
++++ b/srt/speculative/dspark_components/dspark_verify.py
+@@ -1,32 +1,29 @@
+ from __future__ import annotations
+ 
+ from typing import Optional
+ 
+ import msgspec
+ import torch
+ 
+-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+-    is_unified_kv_triton,
+-)
+ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+     AcceptGreedy,
+     AcceptSampling,
+     FinalizeAcceptLens,
+     SelectMixedAccept,
+     SoftmaxTemp,
+ )
+ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+     BuildCommitInjectLayout,
+     BuildOutTokens,
+     BuildRaggedVerifyWindow,
+     RaggedVerifyWindow,
+     ScatterCompactToStrided,
+-    build_unified_commit_inject_layout,
++    build_ring_commit_inject_layout,
+     scatter_compact_to_strided_into,
+ )
+ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+     simulated_bonus_sample,
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+@@ -362,18 +359,18 @@
+                 kv_loc_plan=verify_window.kv_loc_plan,
+             )
+             return
+         hidden = logits_output.hidden_states
+         if hidden is None:
+             raise RuntimeError("DSpark verify requires target hidden states, got None.")
+         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
+         state_slot = None
+-        if is_unified_kv_triton():
+-            # unified_kv needs the per-token draft req slot to address the SWA ring
++        if self.kv_injector.swa_ring_size is not None:
++            # A SWA ring needs the per-token draft req slot to address it
+             # (state_slot * ring + pos % ring). Verify tokens are the latest in each
+             # req so they always fall in the window; the commit gate (via commit_lens
+             # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
+             vlen = verify_window.verify_cache_loc_2d.shape[1]
+             state_slot = (
+                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
+             )
+         cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+@@ -631,17 +628,17 @@
+             return
+         # Same staged locations as target verify; padded and fallback rows skip KV.
+         gated_commit_lens = (
+             torch.minimum(commit_lens, verify_lens.to(torch.int32))
+             * self.inject_gate_buf
+         )
+         cache_loc = forward_batch.out_cache_loc
+         state_slot = None
+-        if is_unified_kv_triton():
++        if self.commit_ctx.kv_injector.swa_ring_size is not None:
+             state_slot = (
+                 forward_batch.req_pool_indices.view(-1, 1)
+                 .expand(bs, self.stride)
+                 .reshape(-1)
+             )
+         self.commit_ctx.kv_injector.inject_target_hidden(
+             target_hidden=out.hidden_states,
+             cache_loc=cache_loc,
+@@ -770,24 +767,24 @@
+         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int
+     ) -> None:
+         ctx = self.commit_ctx
+         pool = ctx.resolve_pool()
+         gated_commit_lens = (
+             torch.minimum(commit_lens, verify_lens.to(torch.int32))
+             * self.inject_gate_buf
+         )
+-        if is_unified_kv_triton():
+-            inject_layout = build_unified_commit_inject_layout(
++        if pool.swa_req_ring_size is not None:
++            inject_layout = build_ring_commit_inject_layout(
+                 req_pool_indices=req_pool_indices,
+                 prefix_lens=seq_lens[:bs],
+                 block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+                 commit_lens=gated_commit_lens,
+                 stride=self.stride,
+-                ring_stride=pool.unified_swa_ring_size,
++                ring_stride=pool.swa_req_ring_size,
+             )
+         else:
+             inject_layout = BuildCommitInjectLayout.execute(
+                 req_pool_indices=req_pool_indices,
+                 req_to_token=ctx.resolve_req_to_token(),
+                 prefix_lens=seq_lens[:bs],
+                 block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+                 full_to_swa_mapping=pool.full_to_swa_index_mapping,
+--- a/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -1,16 +1,13 @@
+ import logging
+ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+ 
+ import torch
+ 
+-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+-    is_unified_kv_triton,
+-)
+ from sglang.srt.configs.hybrid_arch import mambaish_config
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import get_dp_tp_group
+ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+ from sglang.srt.lora.layers import unwrap_lora_layer
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
+ from sglang.srt.managers.tp_worker import TpModelWorker
+@@ -692,34 +689,46 @@
+             batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+         ).to(device, non_blocking=True)
+         positions, _ = compute_position(
+             self.model_runner.prefill_attention_backend_str,
+             draft_seq_lens,
+             ctx_lens,
+             int(sum(batch.extend_lens)),
+         )
+-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
+-        # thread the per-token state_slot + the req's final position so the
+-        # injector keeps only the last SWA window (older prefill tokens share a
+-        # ring slot and would race). Cheap; only consumed under unified_kv.
++        # A SWA ring is keyed by (draft req slot, position); thread the per-token
++        # state_slot + the req's final position so the injector keeps only the
++        # last SWA window (older prefill tokens share a ring slot and would race).
+         state_slot = final_pos = None
+-        if is_unified_kv_triton():
++        if self._kv_injector.swa_ring_size is not None:
+             repeats = ctx_lens.to(torch.int64)
+             num_tokens = sum(batch.extend_lens)
+             state_slot = torch.repeat_interleave(
+                 batch.req_pool_indices.to(device=device, dtype=torch.int64),
+                 repeats,
+                 output_size=num_tokens,
+             )
+             final_pos = torch.repeat_interleave(
+                 (draft_seq_lens + ctx_lens - 1).to(torch.int64),
+                 repeats,
+                 output_size=num_tokens,
+             )
++        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
++        if getattr(draft_pool, "swa_req_ring_valid_from", None) is not None:
++            # A newly placed request's ring holds nothing below its cached prefix.
++            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
++            if placed:
++                draft_pool.reset_swa_req_ring(
++                    batch.req_pool_indices[placed],
++                    torch.tensor(
++                        [batch.prefix_lens[i] for i in placed],
++                        dtype=torch.int64,
++                        device=device,
++                    ),
++                )
+         # The draft KV goes to the slots the target prefill just wrote.
+         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
+         batch_output.kv_loc_plan = None
+         token_indices = logits_output.hidden_states_token_indices
+         if token_indices is not None:
+             cache_loc = cache_loc[token_indices]
+             positions = positions[token_indices]
+             if state_slot is not None:

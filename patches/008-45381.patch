@@ -1,0 +1,23 @@
+--- a/srt/layers/attention/deepseek_v4_backend.py
++++ b/srt/layers/attention/deepseek_v4_backend.py
+@@ -1543,16 +1543,20 @@
+         c_seq_lens = (core.seq_lens_casual // compress_ratio).to(torch.int32)
+         row_chunk = _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+         return PagedIndexerMetadata(
+             page_size=self.page_size,
+             compressed_page_size=index_page_size,
+             page_table=page_table,
+             compressed_seq_lens=c_seq_lens,
+             use_topk_v2=False,
++            # The low-ratio indexer always scores with DeepGEMM's FP4 paged MQA
++            # logits, so it needs the schedule even where the C4 indexer takes
++            # the Torch fallback (the SM120 default), as on the decode path.
++            force_deep_gemm_metadata=get_platform().is_sm120,
+             use_prefill_cuda_graph=True,
+             compress_ratio=compress_ratio,
+             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
+         )
+ 
+     @property
+     def low_ratio_prefill_graph(self) -> bool:
+         """Whether ratio-1/2 sources use captured projections and indexer metadata."""

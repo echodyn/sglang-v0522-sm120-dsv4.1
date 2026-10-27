@@ -1,0 +1,25 @@
+--- a/srt/layers/attention/dsv4/v41_indexer/__init__.py
++++ b/srt/layers/attention/dsv4/v41_indexer/__init__.py
+@@ -77,17 +77,21 @@
+     *,
+     token_to_kv_pool: DeepSeekV4TokenToKVPool,
+     req_to_token: torch.Tensor,
+ ) -> FullTopKIndexer:
+     return FullTopKIndexer(
+         token_to_kv_pool=token_to_kv_pool,
+         req_to_token=req_to_token,
+         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
+-        use_deep_gemm_decode=is_sm100_or_newer(),
++        # SM12x does not have the SM100 DeepGEMM paged-MQA decode path.
++        # Use FullTopKIndexer._torch_decode -> Triton paged scorer instead.
++        use_deep_gemm_decode=(
++            is_sm100_or_newer() and torch.cuda.get_device_capability()[0] != 12
++        ),
+     )
+ 
+ 
+ def make_candidate_indexer(
+     *,
+     token_to_kv_pool: DeepSeekV4TokenToKVPool,
+     req_to_token: torch.Tensor,
+     page_size: int,

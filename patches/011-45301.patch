@@ -1,0 +1,146 @@
+--- a/srt/layers/attention/deepseek_v4_backend.py
++++ b/srt/layers/attention/deepseek_v4_backend.py
+@@ -968,16 +968,18 @@
+ 
+     # Shared by all low-ratio source layers; graph replay refreshes them live.
+     low_ratio_req_indices: Optional[torch.Tensor] = None
+     low_ratio_pos_i64: Optional[torch.Tensor] = None
+ 
+     # Per-step scratch for TP-padded query heads, zeroed by the first user.
+     # Later layers overwrite real heads and preserve the zero padding.
+     q_pad_buffer: Optional[torch.Tensor] = None
++    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
++    q_pad_captured: bool = False
+ 
+     # What the candidate-source layer published for the index-source layers after
+     # it, in the implementation's own type; never copied from the host.
+     candidate_metadata: Optional[CandidateMetadata] = None
+ 
+     # Built at the runner's prefill WAR boundary when the fast path is on,
+     # otherwise lazily by ``_forward_prefill_sparse``.
+     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
+--- a/srt/layers/attention/deepseek_v4_backend_hip_radix.py
++++ b/srt/layers/attention/deepseek_v4_backend_hip_radix.py
+@@ -654,16 +654,18 @@
+ 
+     c4_compress_metadata: Optional[FusedCompressMetadata] = None
+     c128_compress_metadata: Optional[FusedCompressMetadata] = None
+     # per-step inputs of forward_low_ratio_sources, hoisted for one-token rows and the replay tail
+     low_ratio_req_indices: Optional[torch.Tensor] = None
+     low_ratio_pos_i64: Optional[torch.Tensor] = None
+     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
+     q_pad_buffer: Optional[torch.Tensor] = None
++    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
++    q_pad_captured: bool = False
+     # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
+     fp4_low_ratio_decode_workspaces: Dict[int, FP4DecodeWorkspace] = field(
+         default_factory=dict, repr=False
+     )
+     fp4_low_ratio_prefill_workspaces: Dict[int, FP4PrefillWorkspace] = field(
+         default_factory=dict, repr=False
+     )
+     # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
+@@ -707,17 +709,20 @@
+         maybe_copy_inplace(self.c1_indexer_metadata, src=other.c1_indexer_metadata)
+         maybe_copy_inplace(self.c2_indexer_metadata, src=other.c2_indexer_metadata)
+         maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
+         maybe_copy_inplace(
+             self.c128_compress_metadata, src=other.c128_compress_metadata
+         )
+ 
+     # allocated inside a captured segment (graph-pool storage), so a refresh must keep it
+-    BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = ("q_pad_buffer",)
++    BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = (
++        "q_pad_buffer",
++        "q_pad_captured",
++    )
+ 
+     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
+         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
+             other.core_attn_metadata
+         )
+         if not self.core_attn_metadata.low_ratios:
+             maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
+             maybe_copy_inplace(
+--- a/srt/models/deepseek_v4.py
++++ b/srt/models/deepseek_v4.py
+@@ -1048,16 +1048,44 @@
+                 if flashinfer_dsv4_decode_supports_num_heads(
+                     self.n_local_heads, num_tokens
+                 ):
+                     return self.n_local_heads
+ 
+         # Other FlashMLA implementations retain their existing padded shape.
+         return 64 if self.n_local_heads <= 64 else self.n_heads
+ 
++    def _zero_padded_q(self, x, kernel_num_heads, attn_backend) -> torch.Tensor:
++        # One zeroed buffer per metadata, grown to the most rows it has served; each
++        # call takes a row slice. A graph that keeps the metadata keeps the buffer,
++        # so the buffer must not grow once a graph has captured it.
++        meta = getattr(attn_backend, "forward_metadata", None)
++        buf = getattr(meta, "q_pad_buffer", None)
++        if (
++            buf is None
++            or buf.shape[0] < x.shape[0]
++            or buf.shape[1:] != (kernel_num_heads, self.head_dim)
++            or buf.dtype != x.dtype
++        ):
++            assert not getattr(meta, "q_pad_captured", False), (
++                "the padded query buffer grew after a CUDA graph captured it"
++            )
++            buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
++            if meta is not None:
++                try:
++                    meta.q_pad_buffer = buf
++                except (AttributeError, TypeError):
++                    pass
++        if meta is not None and torch.cuda.is_current_stream_capturing():
++            try:
++                meta.q_pad_captured = True
++            except (AttributeError, TypeError):
++                pass
++        return buf[: x.shape[0]]
++
+     def _local_attn_sink(self, kernel_num_heads: Optional[int] = None) -> torch.Tensor:
+         if self.attn_tp_size == 1:
+             return self.attn_sink
+ 
+         rank = self.attn_tp_rank
+         num_heads = self.n_local_heads
+         padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+         if kernel_num_heads is None:
+@@ -2324,32 +2352,18 @@
+                 self.n_local_heads
+                 if _is_hip and not unified and _hip.skip_head_pad(self)
+                 else self._kernel_num_heads(x.shape[0])
+             )
+             if kernel_num_heads != self.n_local_heads:
+                 # Backends without an exact-head specialization retain the existing
+                 # padded shape. attn_sink is sliced to this rank and padded to match.
+                 if self.is_dsv41:
+-                    # V4.1 kernels read all padded heads, so the padding must be
+-                    # zero. The buffer is reused per layer; no consumer may keep it.
+-                    want = (x.shape[0], kernel_num_heads, self.head_dim)
+-                    meta = getattr(attn_backend, "forward_metadata", None)
+-                    q_padded = getattr(meta, "q_pad_buffer", None)
+-                    if (
+-                        q_padded is None
+-                        or tuple(q_padded.shape) != want
+-                        or q_padded.dtype != x.dtype
+-                    ):
+-                        q_padded = x.new_zeros(*want)
+-                        if meta is not None:
+-                            try:
+-                                meta.q_pad_buffer = q_padded
+-                            except (AttributeError, TypeError):
+-                                pass
++                    # V4.1 kernels read all padded heads, so the padding must be zero.
++                    q_padded = self._zero_padded_q(x, kernel_num_heads, attn_backend)
+                 elif _is_gfx942_supported:
+                     # Uninitialized padded TP heads inject NaN into attention on gfx942
+                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
+                     # the per-forward memset.
+                     q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+                 else:
+                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
+                 tp_slice = slice(0, self.n_local_heads)

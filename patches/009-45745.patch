@@ -1,0 +1,37 @@
+--- a/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -282,10 +282,11 @@
+     def head_weights(self, x: torch.Tensor) -> torch.Tensor:
+         return self.head_weights_raw(x) * self.head_weight_scale
+ 
+     def scores(
+         self, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
+     ) -> torch.Tensor:
+         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
+         s = torch.einsum("bhd,nd->bhn", q, k)
+-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
+-        return s.float()
++        # In place: the [t, H, n] product is the largest prefill transient.
++        s.relu_().mul_(weights.unsqueeze(-1))
++        return s.sum(dim=1).float()
+--- a/srt/layers/attention/dsv4/v41_indexer/scoring.py
++++ b/srt/layers/attention/dsv4/v41_indexer/scoring.py
+@@ -245,17 +245,17 @@
+         )
+         # Free this tile's logits before the generator scores the next one.
+         del logits
+ 
+ 
+ # ---------- torch ----------
+ 
+ 
+-# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
++# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; scores() works in place.
+ _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+ 
+ 
+ class RequestScores(msgspec.Struct, frozen=True):
+     lc: int  # compressed positions visible at its newest row
+     k: int
+     columns: torch.Tensor  # arange(lc)
+     tok: torch.Tensor  # [rows_b] its query rows in the chunk

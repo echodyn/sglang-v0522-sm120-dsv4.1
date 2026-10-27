@@ -1,0 +1,85 @@
+--- a/srt/mem_cache/base_prefix_cache.py
++++ b/srt/mem_cache/base_prefix_cache.py
+@@ -662,16 +662,17 @@
+             pre_len,
+             sliding_window_size=self.sliding_window_size,
+             page_size=self.page_size,
+             req_to_token_pool=self.req_to_token_pool,
+             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+             supports_prefix_sharing=self.supports_prefix_sharing(),
+             retain_floor=self.swa_retain_floor(req),
+             eviction_interval=eviction_interval,
++            reprefill_tail_tokens=self.swa_reprefill_tail_tokens(req),
+         )
+ 
+     def swa_retain_floor(self, req) -> int | None:
+         # A match lands on a state checkpoint rather than on the tail, so a cache
+         # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+         # the last checkpoint. Those caches override this. Everyone else has
+         # nothing deeper than the tail to protect.
+         return None
+--- a/srt/mem_cache/common.py
++++ b/srt/mem_cache/common.py
+@@ -63,16 +63,17 @@
+     page_size: int,
+     req_to_token_pool: ReqToTokenPool,
+     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+     supports_prefix_sharing: bool = True,
+     retain_floor: int | None = None,
+     component_type: ComponentType = ComponentType.SWA,
+     free_segment: Callable[..., None] | None = None,
+     eviction_interval: int = 1,
++    reprefill_tail_tokens: int = 0,
+ ) -> None:
+     if not req.kv.holds_kv:
+         return
+ 
+     # For SWA-capable tree caches, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+     assert req.kv.cache_protected_len % page_size == 0, (
+         "cache_protected_len must be page aligned"
+     )
+@@ -93,16 +94,24 @@
+         # up to the window boundary (the trailing floor keeps it page-aligned).
+         evict_threshold = pre_len - sliding_window_size
+     else:
+         # Prefix-sharing cache: keep max(window, page). The trailing floor page-aligns the
+         # frontier, and subtracting at least one page keeps it below the insert
+         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
+         # No extra page margin is needed.
+         evict_threshold = pre_len - max(sliding_window_size, page_size)
++        if reprefill_tail_tokens:
++            # Matching excludes the replay tail before page alignment. Keep the
++            # SWA window behind that earlier boundary too, or a first replay
++            # falls back to an older checkpoint despite a Full-KV cache hit.
++            replay_boundary = (pre_len - reprefill_tail_tokens) // page_size * page_size
++            evict_threshold = min(
++                evict_threshold, replay_boundary - sliding_window_size
++            )
+     if retain_floor is not None and supports_prefix_sharing:
+         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
+         # this only promises not to free past it. Without prefix sharing a retained
+         # checkpoint could never be matched, so holding it is pure cost.
+         evict_threshold = min(evict_threshold, retain_floor)
+ 
+     new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
+ 
+--- a/srt/mem_cache/unified_cache/components/swa.py
++++ b/srt/mem_cache/unified_cache/components/swa.py
+@@ -1008,16 +1008,17 @@
+         free_swa_out_of_window_slots(
+             req,
+             pre_len,
+             sliding_window_size=self.sliding_window_size,
+             page_size=self.cache.page_size,
+             req_to_token_pool=self.cache.req_to_token_pool,
+             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+             retain_floor=self.cache.swa_retain_floor(req),
++            reprefill_tail_tokens=self.cache.swa_reprefill_tail_tokens(req),
+         )
+ 
+     def free_out_of_window_slots(
+         self, req: Req, pre_len: int, insert_params: InsertParams
+     ) -> None:
+         self._free_out_of_window_slots(req, pre_len)
+         insert_params.set_evicted_seqlen(
+             self.component_type, req.kv.get_evicted_seqlen(self.component_type)

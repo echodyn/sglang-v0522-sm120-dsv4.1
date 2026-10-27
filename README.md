@@ -1,165 +1,87 @@
-# SGLang v0.5.22 — DeepSeek V4.1 Flash on RTX PRO 6000 (SM120)
+# SGLang v0.5.22 — DeepSeek V4.1 Flash on SM120
 
-[English](README.md) | [简体中文](README_CN.md)
+[简体中文](README_CN.md) | [Backport inventory and validation](BACKPORTS.md)
 
-A minimal Docker overlay that patches the official
-[`lmsysorg/sglang:v0.5.22`](https://hub.docker.com/r/lmsysorg/sglang) image so that
-DeepSeek V4.1 Flash can be served on 4× NVIDIA RTX PRO 6000 (Blackwell, compute
-capability SM120) with TP=4 / EP=4.
+A pinned Docker overlay for serving DeepSeek V4.1 Flash on four RTX PRO 6000
+(SM120) GPUs with TP4/EP4, FlashInfer MXFP4 MoE, FP8 KV and DSPARK.
 
-The overlay rewrites three Python source files *inside* the container image at
-build time — two upstream PR backports plus one FullTopK decode routing fix. It
-never recompiles kernels and never touches pip package metadata, so the build
-stays fast and the base image stays otherwise identical.
+The bundle backports **17 upstream PRs**, including the original #42371/#42368
+and 15 additional fixes, preserves the original SM12x FullTopK Triton fallback,
+and verifies the already-shipped #42709 dependency. It changes 28 Python source
+files and checks 29 files against the exact v0.5.22 commit
+`baa9befa381511cd4d56f83980951e5a45fffc6d`.
 
-## Repository layout
+Merged and open PR changes are vendored as ordered unified diffs. Docker builds
+do not download patches or follow moving branches. Dependency versions remain
+those of the official base image. The bundle covers indexer metadata, graph
+buffer lifetimes, DSpark compact verify, SWA windows and prefix retention, CP,
+idle DP ranks, KV budgeting and MoE prefill autotuning. See
+[BACKPORTS.md](BACKPORTS.md) for every source, adaptation and excluded feature.
 
-| File | Purpose |
-|---|---|
-| `Dockerfile` | Builds on `lmsysorg/sglang:v0.5.22`, runs both patch scripts, then removes them |
-| `patch_sm120.py` | Backports upstream SGLang PRs [#42371](https://github.com/sgl-project/sglang/pull/42371) and [#42368](https://github.com/sgl-project/sglang/pull/42368) into the installed sglang tree |
-| `patch_full_topk_sm120.py` | FullTopK fix v2: routes SM12x FullTopK decode away from the DeepGEMM path |
-| `compose.yaml` | 4-GPU deployment (TP=4 / EP=4), port 8000 |
+## Build and serve
 
-## What gets patched
+Requirements: Docker with NVIDIA Container Toolkit, four visible GPUs, enough
+GPU/host memory, and locally downloaded DeepSeek V4.1 Flash weights.
 
-### 1. PR #42371 backport — SM120 indexer backends (`patch_sm120.py`)
-
-SM120 lacks the SM100-specific DeepGEMM sparse paged-MQA logits support. Two
-changes make the DSV4.1 indexer work on SM120:
-
-- `srt/layers/attention/dsv4/v41_indexer/__init__.py` — when
-  `DEEPGEMM_PAGED_SPARSE_MQA_LOGITS` is unavailable, return the `dense_blocks`
-  backend on SM120 instead of raising `RuntimeError`.
-- `srt/layers/attention/dsv4/v41_indexer/scoring.py` —
-  `paged = get_platform().is_sm90` becomes `is_sm90 or is_sm120`, so decode
-  uses the Triton paged index scorer on SM120.
-
-### 2. PR #42368 backport — FlashInfer 0.7 compatibility (`patch_sm120.py`)
-
-FlashInfer 0.7 changed `_DECODE_DSV4_DISPATCH` from a set of head counts into a
-membership-only envelope. `kernels/ops/attention/flash_mla_sm120.py` is updated
-so the capability probe returns the dispatch object directly and the support
-test becomes `(num_heads, 512) in dispatch`.
-
-### 3. FullTopK decode routing fix — the crash this repo fixes (`patch_full_topk_sm120.py`)
-
-**Root cause.** `make_full_topk_indexer` sets
-`use_deep_gemm_decode=is_sm100_or_newer()`, which includes all SM12x GPUs even
-though the SM100-specific paged-MQA metadata is absent on SM120. During
-FlashInfer autotune / CUDA Graph warmup, `fp8_fp4_paged_mqa_logits` is called
-with `schedule_meta=None` and errors out in TVM FFI.
-
-**Fix.** The condition becomes
-`is_sm100_or_newer() and torch.cuda.get_device_capability()[0] != 12`, so SM12x
-FullTopK decode uses `_torch_decode()` — which the scoring.py change from
-patch 1 then routes to the Triton paged scorer. Model weights, FlashInfer
-version, MoE TP4/EP4 and candidate-indexer behavior are unchanged.
-
-### Patch safety properties
-
-Both scripts locate the installed sglang tree via `importlib`, perform strict
-single-match string replacement, and `py_compile` every file they touch:
-
-- A base image that differs from v0.5.22 **fails the build fast** instead of
-  producing a silently broken image.
-- Re-running a script on an already-patched tree is a no-op ("already applied").
-- Compiled kernels and pip package metadata are never edited.
-
-## Requirements
-
-- 4× NVIDIA RTX PRO 6000 (SM120), visible to Docker via the NVIDIA Container Toolkit
-- Docker Engine + docker compose v2
-- DeepSeek V4.1 Flash weights already downloaded to the host
-  (`HF_HUB_OFFLINE=1` is set, so nothing is fetched at runtime)
-
-## Quick start
-
-**1. Point the compose file at your local weights.** Edit `compose.yaml` and
-replace both `HOST_MODEL_PATH` / `CONTAINER_MODEL_PATH` placeholders — the
-`volumes:` entry and the `--model-path` argument must stay consistent:
-
-```yaml
-    volumes:
-      - /data/models/deepseek-v4.1-flash:/models/dsv41-flash   # was HOST_MODEL_PATH:CONTAINER_MODEL_PATH
-```
-
-```yaml
-      - --model-path
-      - "/models/dsv41-flash"                                   # was CONTAINER_MODEL_PATH
-```
-
-**2. Build and start:**
+Edit both placeholders in `compose.yaml`: set the volume to
+`/data/models/deepseek-v4.1-flash:/models/dsv41-flash` and the
+`--model-path` argument to `/models/dsv41-flash`.
 
 ```bash
 docker compose up -d --build
+docker logs -f dsv41-sm120
+curl http://localhost:8000/health
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dsv41-flash-1017","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-The image is built locally as `sglang:v0.5.22-sm120-dsv41`. To build it without
-compose:
+The output image is `sglang:v0.5.22-sm120-dsv41`. Standalone builds:
 
 ```bash
 docker build -t sglang:v0.5.22-sm120-dsv41 .
+docker build --build-arg BASE_IMAGE=your-exact-v0522-image \
+  -t sglang:v0.5.22-sm120-dsv41 .
 ```
 
-**3. Verify:**
+The default configuration retains TP4/EP4 (set EP=4 explicitly on SM120),
+`--attention-backend dsv4`, `--moe-runner-backend flashinfer_mxfp4`,
+`--fp8-gemm-backend cutlass`, FP8 E4M3 KV, DSPARK block size 5,
+512K context, 16384-token prefill chunks, static memory fraction 0.9 and 48
+running requests. Host Engram tables and offline model loading stay enabled.
+CP, encoder replay and compact verify fixes take effect when those optional
+features are enabled; the default compose does not enable them.
+
+Prefill MoE autotuning now covers larger buckets, which may increase startup
+time and tuning-buffer memory. No local SM120 performance result is claimed.
+
+## Patching and verification
+
+`patch_sm120.py` is the complete entry point and must be copied together with
+`patches/`. `patch_full_topk_sm120.py` is retained as a compatibility
+entry point to the same bundle. Before writing, the patcher checks every source
+hash, hunk, result hash and Python syntax. Known original overlay states can be
+upgraded, repeat runs are no-ops, and unknown source trees fail.
 
 ```bash
-# Wait for startup (CUDA Graph capture takes a while), then:
-curl http://localhost:8000/health
+# Fetch only pinned upstream files into a temporary directory; torch CPU tests:
+python3 scripts/verify_backports.py --require-torch
 
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "dsv41-flash-1017",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+# Offline verification using pristine upstream sources:
+python3 scripts/verify_backports.py \
+  --source-root /path/to/sglang/python/sglang --require-torch
+
+# Verify the completed bundle inside the container:
+docker compose exec sglang \
+  python3 /opt/sglang-sm120-backports/patch_sm120.py --verify
+
+# Inspect a target installation without writing:
+python3 patch_sm120.py --root /path/to/installed/sglang --check
 ```
 
-Logs: `docker logs -f dsv41-sm120`.
-
-## Deployment configuration
-
-Key launch parameters in `compose.yaml`:
-
-| Parameter | Value | Notes |
-|---|---|---|
-| `--tp` | `4` | One GPU per tensor-parallel rank |
-| `--ep-size` | `4` | **Must be set on SM120** — or the launch will fail |
-| `--attention-backend` | `dsv4` | DSV4 attention path |
-| `--moe-runner-backend` | `flashinfer_mxfp4` | MXFP4-quantized MoE (the "Flash" variant) |
-| `--fp8-gemm-backend` | `cutlass` | FP8 GEMM backend |
-| `--kv-cache-dtype` | `fp8_e4m3` | FP8 KV cache |
-| `--speculative-algorithm` | `DSPARK` | Speculative decoding |
-| `--speculative-dspark-block-size` | `5` | DSPARK block size |
-| `--context-length` | `524288` | 512K context |
-| `--chunked-prefill-size` | `16384` | Prefill chunking |
-| `--mem-fraction-static` | `0.9` | Static memory fraction |
-| `--max-running-requests` | `48` | Concurrency cap |
-
-Environment variables:
-
-| Variable | Value | Purpose |
-|---|---|---|
-| `HF_HUB_OFFLINE` | `1` | Never fetch from the hub; weights come from the mounted volume |
-| `SGLANG_SM120_FLASHMLA_BACKEND` | `flashinfer` | Select the FlashMLA backend on SM120 |
-| `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE` | `1` | Offload the DSV41 E-gram table to host memory |
-
-GPUs are pinned via `deploy.resources.reservations.devices.device_ids`
-(`0–3`); adjust for your machine. `restart: unless-stopped` is commented out —
-enable it if you want the service to survive reboots.
-
-## Troubleshooting & notes
-
-This project has been tested successfully on a server with 8× RTX PRO 6000
-GPUs.
-
-- **`FP8 block GEMM ... missing tuning configs` warnings at startup** are
-  performance warnings only and unrelated to any crash.
-- **Build error like "expected 1 match … the base image differs from SGLang
-  v0.5.22"** means your local base image is not the exact official v0.5.22.
-  Pull `lmsysorg/sglang:v0.5.22` (or point the `FROM` line at your local copy
-  of that exact image/digest) and rebuild.
-- **Container exits early** — check `docker logs dsv41-sm120`; first startup
-  includes autotune and CUDA Graph capture and can look idle for several
-  minutes.
+Local validation: 32 CPU regressions, pristine-source application, both legacy
+overlay stages, idempotency, and final hashes/syntax for 29 files. Kernel-launch
+stubs cover ownership only. This machine has no v0.5.22 Docker base image or
+NVIDIA GPU: a real image build and SM120 serving/accuracy checks are still
+required. Historical validation of the original smaller overlay does not
+validate this expanded bundle.

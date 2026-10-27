@@ -1,0 +1,136 @@
+--- a/kernels/ops/attention/flash_mla_sm120.py
++++ b/kernels/ops/attention/flash_mla_sm120.py
+@@ -9,17 +9,17 @@
+ The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
+ stride (nope_dim + rope_dim*2) per token, and scales are stored in a
+ separate region at the end of each page.
+ """
+ 
+ import logging
+ import math
+ from functools import lru_cache
+-from typing import FrozenSet, Optional, Tuple
++from typing import Container, Optional, Tuple
+ 
+ import torch
+ import triton
+ import triton.language as tl
+ 
+ from sglang.srt.environ import envs
+ from sglang.srt.utils import is_hip
+ 
+@@ -262,42 +262,46 @@
+         extra_indices=extra_idx,
+         extra_topk_length=extra_topk_length,
+         mid_out=None,
+         mid_lse=None,
+     )
+     return (output.unsqueeze(1), None)
+ 
+ 
++_DSV4_DECODE_PROBE_TOPK = 512
++
+ @lru_cache(maxsize=1)
+-def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
++def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, Container[Tuple[int, int]]]:
+     """Read the installed FlashInfer DSV4 decode capabilities once."""
+     try:
+         from flashinfer.mla._sparse_mla_sm120 import (
+             _DECODE_DSV4_DISPATCH,
+             _DECODE_MAX_TOKENS,
+         )
+     except (AttributeError, ImportError):
+         return 0, frozenset()
+ 
+-    return int(_DECODE_MAX_TOKENS), frozenset(
+-        heads for heads, _ in _DECODE_DSV4_DISPATCH
+-    )
++    # FlashInfer <=0.6 exposes a set; 0.7 exposes a membership-only envelope.
++    return int(_DECODE_MAX_TOKENS), _DECODE_DSV4_DISPATCH
+ 
+ 
+ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
+     """Return whether FlashInfer supports this DSV4 decode head count.
+ 
+     Keep this capability check fail-closed because SGLang can be used with a
+     locally installed FlashInfer even though the release dependency is pinned.
+     The padded 64-head decode path remains the safe fallback for older builds.
+     Prefill head selection is handled separately by the caller.
+     """
+-    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
+-    return num_tokens <= decode_max_tokens and num_heads in supported_heads
++    decode_max_tokens, dispatch = _flashinfer_dsv4_decode_capabilities()
++    return (
++        num_tokens <= decode_max_tokens
++        and (num_heads, _DSV4_DECODE_PROBE_TOPK) in dispatch
++    )
+ 
+ 
+ def flash_mla_with_kvcache_sm120(**kwargs):
+     """SM120 FlashMLA sparse decode entry point.
+ 
+     Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback.
+     """
+     q = kwargs["q"]
+--- a/srt/layers/attention/dsv4/v41_indexer/__init__.py
++++ b/srt/layers/attention/dsv4/v41_indexer/__init__.py
+@@ -89,17 +89,17 @@
+ def make_candidate_indexer(
+     *,
+     token_to_kv_pool: DeepSeekV4TokenToKVPool,
+     req_to_token: torch.Tensor,
+     page_size: int,
+     candidate_topk_blocks: int,
+     candidate_block_size: int,
+ ) -> Tuple[PrefillCandidates, DecodeCandidates]:
+-    from sglang.srt.runtime_context import get_parallel
++    from sglang.srt.runtime_context import get_parallel, get_platform
+ 
+     from .dense_blocks import DenseBlocksBackend
+ 
+     use_deep_gemm_prefill = _use_deep_gemm_prefill()
+     dense_blocks = DenseBlocksBackend(
+         token_to_kv_pool=token_to_kv_pool,
+         req_to_token=req_to_token,
+         candidate_topk_blocks=candidate_topk_blocks,
+@@ -110,16 +110,19 @@
+     if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+         return dense_blocks, dense_blocks
+ 
+     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
+     )
+ 
+     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
++        # Backport PR #42371: use dense-blocks scheme on SM120.
++        if get_platform().is_sm120:
++            return dense_blocks, dense_blocks
+         raise RuntimeError(
+             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
+             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+         )
+     from .sparse_table import SparseTableBackend
+ 
+     sparse_table = SparseTableBackend(
+         token_to_kv_pool=token_to_kv_pool,
+--- a/srt/layers/attention/dsv4/v41_indexer/scoring.py
++++ b/srt/layers/attention/dsv4/v41_indexer/scoring.py
+@@ -378,17 +378,17 @@
+     req_to_token: torch.Tensor,
+     candidate_mask: Optional[torch.Tensor] = None,
+ ) -> Optional[DecodeScores | PagedDecodeScores]:
+     """None when there is no row, or nothing visible yet."""
+     pool = token_to_kv_pool
+     ratio = inputs.compress_ratio
+     indexer = inputs.indexer
+     req, pos = inputs.req_rows, inputs.positions
+-    paged = get_platform().is_sm90
++    paged = get_platform().is_sm90 or get_platform().is_sm120
+     bs = req.shape[0]
+     assert pos.shape[0] == bs, (
+         f"decode expects one token per request, {pos.shape=} {bs=}"
+     )
+     if bs == 0:
+         inputs.reset_outputs()
+         return None
+     lens = (pos + 1) // ratio

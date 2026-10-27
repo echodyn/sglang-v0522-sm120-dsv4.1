@@ -1,0 +1,85 @@
+--- a/srt/layers/attention/deepseek_v4_backend.py
++++ b/srt/layers/attention/deepseek_v4_backend.py
+@@ -3592,20 +3592,25 @@
+         tail = tail_metadata.late_layer_tail
+         tail_metadata.candidate_metadata = published.tail(
+             tail.local_lens_cpu
+             if tail.cp_metadata is not None
+             else tail.extend_seq_lens_cpu
+         )
+ 
+     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+-        """Idle always re-translates at store time: its metadata may be stale, and
+-        translating the zero-padded out_cache_loc writes to the dummy slot."""
++        """Idle never trusts its metadata, which may be stale or unset: it writes
++        the request window's idle layout, or translates the zero-padded
++        out_cache_loc to the dummy slot."""
+         metadata = self.forward_metadata
+         if self.token_to_kv_pool.request_window is not None:
++            if forward_batch.forward_mode.is_idle():
++                return self.token_to_kv_pool.request_window.activate_idle(
++                    forward_batch.out_cache_loc.shape[0]
++                )
+             layout = metadata.core_attn_metadata.request_window_layout
+             self.token_to_kv_pool.request_window.activate(layout)
+             return layout.write_loc
+         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
+             # The tail's q rows are a subset of the extend, so the full
+             # out_cache_loc below would be the wrong length; the tail owns its own.
+             return metadata.late_layer_tail.swa_out_cache_loc
+         out_cache_loc = forward_batch.out_cache_loc
+--- a/srt/mem_cache/dsv41_request_window.py
++++ b/srt/mem_cache/dsv41_request_window.py
+@@ -172,16 +172,17 @@
+             dtype=torch.int64,
+             device=self.state.kv_buffer[0].device,
+         )
+         self.workspace = None
+         if workspace_rows:
+             self._ensure_workspace(workspace_rows)
+         self.layout = None
+         self.prepared = None
++        self._idle_layout = None
+ 
+     def _ensure_workspace(self, rows: int) -> None:
+         if self.workspace is not None and self.workspace.size >= rows:
+             return
+         assert not _capturing(), "request-window workspace must be sized before capture"
+         size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
+         self.workspace = self.pool_factory(size, 1)
+ 
+@@ -200,16 +201,34 @@
+         if self.workspace is None:
+             self._ensure_workspace(layout.size)
+         elif self.workspace.size < layout.size:
+             # Captured graphs hold the workspace address; growing it strands them.
+             raise RuntimeError(
+                 f"request-window workspace too small: {self.workspace.size} rows "
+                 f"for a layout of {layout.size}"
+             )
++
++    def activate_idle(self, num_rows: int) -> torch.Tensor:
++        """Activate a layout for an idle forward, whose attention metadata is
++        stale or unset. Its rows write the workspace past an empty history, and
++        an idle forward never commits them."""
++        layout = self._idle_layout
++        if layout is None or layout.pos.numel() != num_rows:
++            zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
++            layout = window_layout(
++                zeros,
++                zeros,
++                zero_row=self.zero_row,
++                capacity=self.capacity,
++                num_groups=1,
++            )
++            self._idle_layout = layout
++        self.activate(layout)
++        return layout.write_loc
+ 
+     def initialize_dummy_history(self):
+         layout = self.layout
+         self.tags.fill_(-1)
+         loc = layout.history_req * self.capacity + layout.history_pos % self.capacity
+         for buf in self.state.kv_buffer:
+             buf.zero_()
+         self.tags[:, loc] = layout.history_pos
