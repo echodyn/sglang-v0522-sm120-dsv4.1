@@ -6,6 +6,10 @@
 整合 DeepSeek V4.1 Flash 的启动、CUDA graph、DSpark、SWA 缓存和显存预算修复。
 默认部署为 4 卡 TP4/EP4，使用 FlashInfer MXFP4 MoE、FP8 KV 和 DSPARK。
 
+> **另见**：同一套 SM120 + DeepSeek V4.1 Flash 部署的 vLLM 补丁版本
+> [vllm-v0320-sm120-dsv4.1](https://github.com/echodyn/vllm-v0320-sm120-dsv4.1)，
+> 实测更快更稳。
+
 当前整合 **17 个上游 PR**：保留原有 #42371/#42368，新增 15 项回填；
 另保留原有 FullTopK Triton 回退并校验已在基础版本中的 #42709。
 补丁修改 28 个 Python 源码文件，校验 29 个文件。

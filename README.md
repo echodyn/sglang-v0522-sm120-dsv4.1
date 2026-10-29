@@ -5,6 +5,10 @@
 A pinned Docker overlay for serving DeepSeek V4.1 Flash on four RTX PRO 6000
 (SM120) GPUs with TP4/EP4, FlashInfer MXFP4 MoE, FP8 KV and DSPARK.
 
+> **Also available:** I maintain a vLLM patch bundle for the same setup —
+> [vllm-v0320-sm120-dsv4.1](https://github.com/echodyn/vllm-v0320-sm120-dsv4.1) —
+> which measured faster and more stable in real use.
+
 The bundle backports **17 upstream PRs**, including the original #42371/#42368
 and 15 additional fixes, preserves the original SM12x FullTopK Triton fallback,
 and verifies the already-shipped #42709 dependency. It changes 28 Python source
